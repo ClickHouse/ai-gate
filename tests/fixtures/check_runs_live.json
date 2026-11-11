@@ -1,0 +1,62 @@
+{
+  "_comment": [
+    "Shape captured from GitHub's REST check-runs endpoint for a real pull request",
+    "reviewed by Cursor Bugbot. Ids, SHAs, refs and the CI job name are placeholders;",
+    "statuses, conclusions, timestamps, app slugs and the Bugbot check name are as returned."
+  ],
+  "total_count": 2,
+  "check_runs": [
+    {
+      "name": "Cursor Bugbot",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-11-11T07:46:40Z",
+      "completed_at": "2026-11-11T07:50:18Z",
+      "id": 1000,
+      "head_sha": "0000000000000000000000000000000000000000",
+      "app": {
+        "slug": "cursor",
+        "name": "Cursor"
+      },
+      "pull_requests": [
+        {
+          "number": 1,
+          "head": {
+            "sha": "0000000000000000000000000000000000000000",
+            "ref": "feature"
+          },
+          "base": {
+            "sha": "1111111111111111111111111111111111111111",
+            "ref": "main"
+          }
+        }
+      ]
+    },
+    {
+      "name": "test",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-11-11T07:47:43Z",
+      "completed_at": "2026-11-11T07:52:58Z",
+      "id": 1001,
+      "head_sha": "0000000000000000000000000000000000000000",
+      "app": {
+        "slug": "github-actions",
+        "name": "GitHub Actions"
+      },
+      "pull_requests": [
+        {
+          "number": 1,
+          "head": {
+            "sha": "0000000000000000000000000000000000000000",
+            "ref": "feature"
+          },
+          "base": {
+            "sha": "1111111111111111111111111111111111111111",
+            "ref": "main"
+          }
+        }
+      ]
+    }
+  ]
+}

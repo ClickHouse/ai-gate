@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-gate"
+version = "0.1.6"
+description = "Block merge until a pull request has a clean AI review (default: Cursor Bugbot)"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+dependencies = [
+    "PyYAML>=6.0",
+]
+
+[dependency-groups]
+dev = [
+    "black==26.5.1",
+    "mypy==2.4.1",
+    "pytest==9.0.3",
+    "pytest-mock==3.14.0",
+    "ruff==0.17.4",
+    "types-PyYAML==6.0.12.20260906",
+]
+
+[tool.setuptools.packages.find]
+include = ["aigate*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+pythonpath = ["."]
+
+[tool.black]
+target-version = ["py311"]
+
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP", "SIM", "C4", "RUF", "N", "A", "PIE"]
+ignore = ["E501"]  # black owns line length
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+check_untyped_defs = true

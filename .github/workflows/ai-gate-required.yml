@@ -1,0 +1,41 @@
+name: AI review gate (org-required)
+
+# The org-required form of the gate. An organisation ruleset pins this file
+# (this repository, this path, refs/heads/main) and GitHub runs it on pull
+# requests in every enrolled repository. It never checks out the target
+# repository and runs only the pinned action below, so it executes no
+# pull-request code. The ruleset is satisfied by this workflow passing, not by a
+# check name, so a pull request cannot forge the result.
+#
+# GitHub runs a ruleset-required workflow only on opened/synchronize/reopened
+# and will not re-run it when the reviewer finishes later, so the gate waits
+# for the reviewer within this one run (wait-seconds, fail-closed on timeout).
+# Drafts are not skipped: a skipped required workflow counts as a pass.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+# Read-only on code. pull-requests: write only posts the one comment explaining
+# why the gate is withheld; a comment cannot change the verdict. On a fork pull
+# request GitHub downgrades this to read, so that comment is skipped.
+permissions:
+  contents: read
+  checks: read
+  statuses: read
+  pull-requests: write
+
+concurrency:
+  group: ai-gate-required-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      # Pinned to an immutable release tag, never a branch or moving tag: a
+      # moving ref would let whoever can push it change the gate everywhere.
+      - uses: ClickHouse/ai-gate@v0.1.6
+        with:
+          mode: enforce
+          wait-seconds: "900"

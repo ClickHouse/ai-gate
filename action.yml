@@ -1,0 +1,59 @@
+name: AI review gate
+description: >-
+  Fail until the pull request has a clean review from the repository's AI
+  reviewer (default Cursor Bugbot). Optional config in .github/ai-gate.yml,
+  read from the base branch so a pull request cannot change its own rules.
+
+inputs:
+  token:
+    description: >-
+      Token for GitHub reads. Defaults to github.token. A policy that names an
+      @org/team reviewer needs a token with read:org. Pass an elevated token
+      only from a workflow that does not run pull-request code.
+    required: false
+    default: ${{ github.token }}
+  mode:
+    description: >-
+      `enforce` posts the `ai-review-gate` check and fails until the gate is
+      green. `shadow` evaluates once (no waiting, no draft handling), posts the
+      verdict as a neutral `ai-review-gate (shadow)` check and always passes.
+      GitHub counts neutral as passing, so never require the shadow check.
+    required: false
+    default: enforce
+  wait-seconds:
+    description: >-
+      How long to wait in this run for the reviewer to finish, polling until the
+      verdict is final. 0 evaluates once. Use a wait for a ruleset-required
+      workflow: GitHub does not re-run it when the reviewer finishes later. On
+      timeout the gate stays red.
+    required: false
+    default: "0"
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      with:
+        python-version: "3.11"
+
+    - name: Install the gate's dependencies
+      shell: bash
+      # Hash-pinned from uv.lock. The gate itself runs from the action's own
+      # checkout, so nothing else is fetched from PyPI.
+      run: pip install --quiet --require-hashes -r "${GITHUB_ACTION_PATH}/requirements.txt"
+
+    - name: Evaluate the gate
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        PYTHONPATH: ${{ github.action_path }}
+        # Passed through env, never interpolated into the script, so the inputs
+        # cannot inject shell.
+        AIGATE_MODE: ${{ inputs.mode }}
+        AIGATE_WAIT_SECONDS: ${{ inputs.wait-seconds }}
+      run: |
+        case "$AIGATE_MODE" in
+          enforce) exec python -P -m aigate gate ;;
+          shadow)  exec python -P -m aigate gate --shadow ;;
+          *) echo "::error::ai-gate: mode must be 'enforce' or 'shadow', got '$AIGATE_MODE'"; exit 1 ;;
+        esac

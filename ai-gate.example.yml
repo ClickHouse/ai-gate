@@ -1,0 +1,43 @@
+# .github/ai-gate.yml — the AI review gate's per-repository config.
+#
+# EVERYTHING in this file is optional. With no file at all, the gate requires a
+# clean Cursor Bugbot review and nothing else. Add only the parts you want, then
+# delete these comments or keep them — the gate ignores them.
+#
+# The file is read from the branch a pull request targets, never from the pull
+# request's own head, so a pull request cannot change the rules that gate it. A
+# malformed file fails closed: the gate goes red rather than quietly doing
+# nothing.
+
+# --- which AI reviewer(s) must review cleanly --------------------------------
+# Omit this whole key to use the default (Cursor Bugbot). Only reviewers
+# registered in aigate/reviewers.py may be named; an unknown name is an error,
+# not a silent skip. Listing an empty set is also an error — a repo cannot opt
+# out of review by requiring none.
+#
+# reviewers: [bugbot]
+
+# --- the stricter layer ------------------------------------------------------
+# Omit the whole `policy:` key for the simple gate: "a clean AI review merges."
+# Add it to require a human sign-off in the cases below. Once a policy is
+# present, a clean AI review is necessary but no longer sufficient.
+#
+# policy:
+#
+#   # escalation_paths: a change to any of these paths — OR a reviewer finding
+#   # on them — needs an approving review from a non-author member of
+#   # `reviewers`. It fires on the changed file itself, so a sensitive path that
+#   # was edited but drew no finding still escalates (and a fixed finding there
+#   # still escalates). List as many entries as you like; globs use ** and *.
+#   escalation_paths:
+#     - paths: ["auth/**", "infra/**", "**/*secret*"]
+#       reviewers: "@your-org/security"
+#     - paths: ["billing/**"]
+#       reviewers: "@your-org/payments"
+#
+#   # security_dismissal_reviewers: a finding that was dismissed (resolved by
+#   # argument rather than fixed) needs an approving review from a non-author
+#   # member here. One handle only: an @org/team (the action then needs a token
+#   # with read:org to resolve membership) or a single @user (works with the
+#   # default token).
+#   security_dismissal_reviewers: "@your-org/security"

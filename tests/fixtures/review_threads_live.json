@@ -1,0 +1,41 @@
+{
+  "_comment": [
+    "Captured from GitHub's GraphQL API with aigate's review_threads query, on a",
+    "real pull request with real Cursor Bugbot findings. The human author's login,",
+    "the thread ids and the file paths are replaced with placeholders.",
+    "",
+    "It pins GitHub's actual response shape: in the same payload the reviewer's",
+    "login is 'cursor' (no [bot] suffix) under comments[].author.login but",
+    "'cursor[bot]' under resolvedBy.login. The parser must treat both as the",
+    "configured 'cursor[bot]' reviewer. Re-capture with:",
+    "  gh api graphql -f owner=<owner> -f name=<repo> -F pr=<n> -f query='...'"
+  ],
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "author": { "login": "pr-author" },
+        "reviewThreads": {
+          "pageInfo": { "hasNextPage": false },
+          "nodes": [
+            {
+              "id": "PRRT_fixture_thread_1",
+              "isResolved": true,
+              "isOutdated": true,
+              "path": "src/app.py",
+              "resolvedBy": { "login": "cursor[bot]" },
+              "comments": { "nodes": [ { "author": { "login": "cursor" } } ] }
+            },
+            {
+              "id": "PRRT_fixture_thread_2",
+              "isResolved": true,
+              "isOutdated": false,
+              "path": "src/util.py",
+              "resolvedBy": { "login": "cursor[bot]" },
+              "comments": { "nodes": [ { "author": { "login": "cursor" } } ] }
+            }
+          ]
+        }
+      }
+    }
+  }
+}
