@@ -25,7 +25,8 @@ jobs:
           wait-seconds: "900"
 ```
 
-The gate waits up to `wait-seconds` for the reviewer, then passes or fails.
+The gate waits up to `wait-seconds` for the reviewer. If no review arrives in
+time, it fails.
 Use `mode: shadow` to see the verdict without blocking.
 
 To enforce it so that a pull request cannot change or skip it, require
