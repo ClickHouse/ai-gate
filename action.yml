@@ -28,10 +28,26 @@ inputs:
       timeout the gate stays red.
     required: false
     default: "0"
+  post-check-run:
+    description: >-
+      Whether `enforce` mode also posts the `ai-review-gate` check-run on the
+      head commit (needs `checks: write`). Set "false" in the org-required
+      workflow, where the job's own status is the gate and the token has no
+      `checks: write`; the post would only log a 403.
+    required: false
+    default: "true"
 
 runs:
   using: composite
   steps:
+    # Which revision of the action this is, first, so a run's log says it:
+    # the gate canary asserts that the candidate action (the PR head sha) ran.
+    - name: ai-gate action revision
+      shell: bash
+      env:
+        ACTION_REF: ${{ github.action_ref }}
+        ACTION_REPO: ${{ github.action_repository }}
+      run: echo "ai-gate action ${ACTION_REPO:-?}@${ACTION_REF:-?}"
     - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
       with:
         python-version: "3.11"
@@ -51,6 +67,7 @@ runs:
         # cannot inject shell.
         AIGATE_MODE: ${{ inputs.mode }}
         AIGATE_WAIT_SECONDS: ${{ inputs.wait-seconds }}
+        AIGATE_POST_CHECK_RUN: ${{ inputs.post-check-run }}
       run: |
         case "$AIGATE_MODE" in
           enforce) exec python -P -m aigate gate ;;

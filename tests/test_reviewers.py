@@ -25,7 +25,7 @@ def test_not_auto_approve_eligible_flags_a_ci_hosted_reviewer(monkeypatch):
     monkeypatch.setitem(
         REVIEWERS,
         "cihosted",
-        Reviewer("cihosted", "CI Review", "github-actions", "Code Review"),
+        Reviewer("cihosted", "CI Review", "team-review-bot", "Code Review"),
     )
     assert not_auto_approve_eligible(["bugbot", "cihosted"]) == ["cihosted"]
 
@@ -116,3 +116,18 @@ def test_malformed_yaml_is_rejected():
 def test_bugbot_is_identified_by_posting_app_not_name():
     # The registry must pin an app slug; check names can be forged.
     assert REVIEWERS["bugbot"].app_slug
+
+
+def test_github_actions_can_never_be_a_reviewer_identity():
+    # Any workflow in the repository posts checks as github-actions, so a
+    # check "from" it is forgeable; a bespoke reviewer must be its own App.
+    import pytest
+
+    from aigate.reviewers import FORBIDDEN_REVIEWER_APP_SLUGS, REVIEWERS, Reviewer
+
+    assert "github-actions" in FORBIDDEN_REVIEWER_APP_SLUGS
+    with pytest.raises(ValueError, match="github-actions"):
+        Reviewer("ci", "CI Review", "github-actions", "Code Review")
+    assert all(
+        r.app_slug not in FORBIDDEN_REVIEWER_APP_SLUGS for r in REVIEWERS.values()
+    )

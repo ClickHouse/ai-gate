@@ -19,6 +19,8 @@ import re
 from dataclasses import dataclass
 from functools import cache
 
+from .render import safe_inline
+
 # Tiers, low to high. The numbers are ordinal; compare with ``max``.
 TIER_0 = 0  # documentation-like; lowest consequence
 TIER_1 = 1  # ordinary code and tests; needs review coverage, not a human by default
@@ -177,7 +179,13 @@ def classify_path(path: str) -> tuple[int, str]:
 
     if best_tier >= 0:
         return best_tier, best_reason
-    return UNKNOWN_PATH_TIER, f"unmapped area {_top_level(path)!r} (unknown raises)"
+    # The directory name is the pull request's: rendered through aigate.render
+    # so it reaches the summary and the comment as a code span, never as
+    # Markdown or a workflow command (round 8, Codex 2).
+    return (
+        UNKNOWN_PATH_TIER,
+        f"unmapped area {safe_inline(_top_level(path))} (unknown raises)",
+    )
 
 
 def classify(

@@ -104,6 +104,33 @@ def is_reviewer_run(signal: Signal, reviewer: Reviewer) -> bool:
     return signal.app_slug == reviewer.app_slug and signal.name == reviewer.check_name
 
 
+def all_required_green(
+    required: list[str], signals: list[Signal]
+) -> tuple[bool, list[str]]:
+    """Return ``(every required reviewer is green, what is still waiting)``.
+
+    The same rule ``decide`` applies, as a pure yes/no for callers that must
+    not spend anything until the gate COULD be green (the approver's proof
+    step and its backstop): for each required reviewer, its runs on the head
+    are picked by :func:`is_reviewer_run`, a run still in progress means
+    waiting, and otherwise the most recently completed run decides. The
+    waiting list names each reviewer that is not green with why, e.g.
+    ``Cursor Bugbot (pending)`` or ``Polyglot (failure)``; a reviewer with no
+    run at all is ``(missing)``. Empty when the first element is True.
+    """
+    waiting: list[str] = []
+    for key in required:
+        rv = REVIEWERS[key]
+        mine = [s for s in signals if is_reviewer_run(s, rv)]
+        if not mine:
+            waiting.append(f"{rv.label} (missing)")
+        elif any(s.conclusion == PENDING for s in mine):
+            waiting.append(f"{rv.label} (pending)")
+        elif (latest := _latest(mine)).conclusion != SUCCESS:
+            waiting.append(f"{rv.label} ({latest.conclusion or 'unknown'})")
+    return not waiting, waiting
+
+
 def decide(
     required: list[str],
     signals: list[Signal],

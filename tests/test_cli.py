@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import re
 from pathlib import Path
 
 import pytest
@@ -327,6 +328,9 @@ def test_cmd_gate_falls_back_to_create_when_the_update_fails(mocker):
 # The action sits at the root of the standalone repository, or under
 # .github/actions/ai-gate/ where the package is vendored into a larger one.
 _ROOT = Path(__file__).resolve().parents[1]
+# The release the org-required workflow currently pins (not the package
+# version, which may be ahead until that tag exists).
+
 ACTION = next(
     p
     for p in (
@@ -351,6 +355,11 @@ def test_action_mode_defaults_to_enforce_and_is_never_interpolated_into_shell():
     assert action["inputs"]["wait-seconds"]["default"] == "0"
     assert "inputs.wait-seconds" not in step["run"]
     assert step["env"]["AIGATE_WAIT_SECONDS"] == "${{ inputs.wait-seconds }}"
+    # post-check-run likewise, defaulting to posting (the advisory callers
+    # need the check-run; the org-required workflow turns it off).
+    assert action["inputs"]["post-check-run"]["default"] == "true"
+    assert "inputs.post-check-run" not in step["run"]
+    assert step["env"]["AIGATE_POST_CHECK_RUN"] == "${{ inputs.post-check-run }}"
     # Only the two known modes run the gate; anything else fails the step.
     assert "enforce) exec python -P -m aigate gate ;;" in step["run"]
     assert "shadow)  exec python -P -m aigate gate --shadow ;;" in step["run"]
@@ -745,10 +754,56 @@ def test_red_gate_links_each_unresolved_finding(mocker):
     assert cli.main(["gate"]) == 1
     body = _gate_comment()
     assert "Unresolved findings (1):" in body
-    assert "[src/a.rs](https://x/1)" in body
+    assert "[`src/a.rs`](https://x/1)" in body
     assert "src/b.rs" not in body
     # The list sits above the steps, not after them.
     assert body.index("Unresolved findings") < body.index("**What to do:**")
+
+
+def test_the_findings_block_renders_a_hostile_path_safely(mocker):
+    # Round 7 (Codex 10): the link text is the PR's path, rendered through
+    # aigate.render so it cannot close the link or start a workflow command.
+    _patch_event(mocker)
+    mocker.patch.object(github, "read_config_text", return_value=None)
+    mocker.patch.object(github, "signals_for", return_value=_bugbot("neutral"))
+    hostile = "src/a.rs](https://evil)\n::warning::x`"
+    payload = {
+        "data": {
+            "repository": {
+                "pullRequest": {
+                    "reviewThreads": {
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        "nodes": [
+                            {
+                                "id": "T1",
+                                "isResolved": False,
+                                "isOutdated": False,
+                                "path": hostile,
+                                "resolvedBy": None,
+                                "comments": {
+                                    "nodes": [
+                                        {
+                                            "url": "https://x/1",
+                                            "author": {"login": "cursor"},
+                                        }
+                                    ]
+                                },
+                            }
+                        ],
+                    },
+                }
+            }
+        }
+    }
+    mocker.patch.object(github, "review_threads", return_value=payload)
+    assert cli.main(["gate"]) == 1
+    body = _gate_comment()
+    from aigate.render import safe_inline
+
+    assert f"- [{safe_inline(hostile)}](https://x/1)" in body
+    assert hostile not in body
+    assert "](https://evil)" not in body.replace(safe_inline(hostile), "")
+    assert not any(line.startswith("::") for line in body.splitlines())
 
 
 def test_unreadable_threads_keep_the_verdict(mocker):
@@ -782,7 +837,11 @@ def test_timed_out_wait_says_it_stopped_waiting(mocker, monkeypatch):
     monkeypatch.setenv("AIGATE_WAIT_SECONDS", "900")
     monkeypatch.setenv("AIGATE_POLL_SECONDS", "900")
     assert cli.main(["gate"]) == 1
-    assert "stopped waiting after 15 minutes" in _gate_comment()
+    body = _gate_comment()
+    assert "stopped waiting after 15 minutes" in body
+    # Nobody has to click "Re-run jobs": the approver does it, or the command.
+    assert "re-runs this gate automatically" in body
+    assert "/ai-gate check" in body
 
 
 def test_config_error_says_fix_it_on_the_base_branch(mocker):
@@ -807,6 +866,8 @@ def test_draft_fails_at_once_and_says_mark_it_ready(mocker, monkeypatch):
     assert "Draft pull request" in body
     assert "Ready for review" in body
     assert "stopped waiting" not in body
+    assert "re-runs this gate automatically" in body and "/ai-gate check" in body
+    assert "does not re-run the gate by itself" not in body
 
 
 def test_draft_that_bugbot_did_review_is_judged_normally(mocker):
@@ -944,3 +1005,151 @@ def test_a_config_error_still_offers_the_rerun_link(mocker, monkeypatch):
     monkeypatch.setenv("GITHUB_RUN_ID", "42")
     assert cli.main(["gate"]) == 1
     assert "Re-run the gate" in _gate_comment()
+
+
+def test_evaluate_with_a_pre_read_config_does_not_read_it_again(mocker):
+    read = mocker.patch.object(github, "read_config_text", return_value=None)
+    mocker.patch.object(
+        github,
+        "signals_for",
+        return_value=[
+            Signal(app_slug=BUGBOT, name="Cursor Bugbot", conclusion=SUCCESS)
+        ],
+    )
+    pull = github.PullRef(1, "deadbeef", "main", "2000-01-01T00:00:00Z")
+    decision = cli.evaluate(
+        "o/r", pull, "cursor[bot]", human_fallback=False, gate_text=None
+    )
+    assert decision.outcome == SUCCESS
+    read.assert_not_called()
+    # Unset, it reads the file itself, from the base branch.
+    cli.evaluate("o/r", pull, "cursor[bot]", human_fallback=False)
+    read.assert_called_once_with("o/r", "main", cli.GATE_CONFIG_PATH)
+
+
+def test_post_check_run_false_skips_the_check_but_not_the_verdict(mocker, monkeypatch):
+    # The org-required workflow has no checks: write; its job status is the
+    # gate. Posting only logged "could not post … 403" on every run.
+    post = _patch_event(mocker)
+    mocker.patch.object(github, "read_config_text", return_value=None)
+    mocker.patch.object(github, "signals_for", return_value=[])  # PENDING -> red
+    monkeypatch.setenv("AIGATE_POST_CHECK_RUN", "false")
+    assert cli.main(["gate"]) == 1
+    post.assert_not_called()
+    assert "Waiting for AI review" in _gate_comment()  # the comment still explains
+    monkeypatch.setenv("AIGATE_POST_CHECK_RUN", "true")
+    assert cli.main(["gate"]) == 1
+    post.assert_called_once()
+
+
+def _required_workflow_path() -> tuple[Path, str]:
+    # Beside the action in the monorepo (.github/actions/ai-gate/../../workflows)
+    # or at the repository root of the standalone public copy; which one it is
+    # decides the exact `uses:` the workflow may carry.
+    private = ACTION.parent.parent.parent / "workflows" / "ai-gate-required.yml"
+    if private.exists():
+        return private, "private"
+    public = _ROOT / ".github" / "workflows" / "ai-gate-required.yml"
+    if public.exists():
+        return public, "public"
+    pytest.skip("no org-required workflow beside this copy of the action")
+
+
+# What the org-required workflow may contain, and nothing else. It runs on
+# pull_request_target with a write-capable token in the base repository, so
+# its whole execution boundary is pinned here: one job, one step, the trusted
+# action, literal inputs, no checkout, no shell, no expression but the integer
+# PR number in the concurrency group, no permission beyond the three.
+ALLOWED_EXPRESSIONS = {"github.event.pull_request.number || github.run_id"}
+ALLOWED_PERMISSIONS = {"contents": "read", "checks": "read", "pull-requests": "write"}
+ALLOWED_WITH = {"mode", "wait-seconds", "post-check-run"}
+
+# The one action each copy of the workflow may run, at @main of its OWN
+# repository: the org ruleset reads the workflow itself from refs/heads/main,
+# so main is already the trust root and an action at @main has the same
+# protection. A tag, a sha or any other ref is refused.
+EXACT_ACTION = {
+    "private": "ClickHouse/security-integrations/.github/actions/ai-gate",
+    "public": "ClickHouse/ai-gate",
+}
+TRUSTED_REF = "main"
+
+
+def test_the_org_required_workflow_runs_the_trusted_action_at_main_and_has_no_checks_write():
+    required, copy = _required_workflow_path()
+    text = required.read_text()
+    workflow = yaml.safe_load(text)
+    on = workflow.get(True, workflow.get("on"))  # PyYAML reads `on:` as True
+    assert set(on) == {"pull_request_target"}
+    assert set(on["pull_request_target"].get("types", [])) <= {
+        "opened",
+        "synchronize",
+        "reopened",
+    }
+    assert workflow["permissions"] == ALLOWED_PERMISSIONS
+    assert set(workflow["jobs"]) == {"gate"}
+    job = workflow["jobs"]["gate"]
+    assert set(job) <= {"runs-on", "steps"} and job["runs-on"] == "ubuntu-latest"
+    assert "if" not in job
+    (step,) = job["steps"]
+    assert set(step) <= {"uses", "with"}
+    assert "run" not in step and "checkout" not in step["uses"]
+    # Exactly this repository's action at @main — the trust root the ruleset
+    # already reads the workflow from. Nothing else: not a tag, not a sha, not
+    # another repository's copy.
+    assert step["uses"] == f"{EXACT_ACTION[copy]}@{TRUSTED_REF}", step["uses"]
+    if copy == "public":
+        assert "security-integrations" not in step["uses"]
+    assert step["with"]["mode"] == "enforce"
+    assert step["with"]["post-check-run"] == "false"
+    assert set(step["with"]) <= ALLOWED_WITH
+    assert all(isinstance(v, str) and "${{" not in v for v in step["with"].values())
+    # No expression anywhere but the concurrency group's integer PR number
+    # (DOTALL: a multi-line expression would otherwise slip past).
+    expressions = {
+        " ".join(m.split()) for m in re.findall(r"\$\{\{(.*?)\}\}", text, re.S)
+    }
+    assert expressions <= ALLOWED_EXPRESSIONS, expressions
+    assert workflow["concurrency"]["cancel-in-progress"] is False
+    # Nothing else that executes or widens: no env, container, services,
+    # defaults, outputs, or a second workflow trigger.
+    assert set(workflow) <= {True, "on", "name", "permissions", "concurrency", "jobs"}
+    assert "env:" not in text and "container:" not in text and "services:" not in text
+    assert "actions/checkout" not in text
+
+
+def test_evaluate_with_prefetched_signals_reads_no_check_runs(mocker):
+    read = mocker.patch.object(github, "signals_for")
+    pull = github.PullRef(1, "deadbeef", "main", "2000-01-01T00:00:00Z")
+    signals = [Signal(app_slug=BUGBOT, name="Cursor Bugbot", conclusion=SUCCESS)]
+    decision = cli.evaluate(
+        "o/r",
+        pull,
+        "cursor[bot]",
+        human_fallback=False,
+        gate_text=None,
+        signals=signals,
+    )
+    assert decision.outcome == SUCCESS
+    read.assert_not_called()
+
+
+def test_call_counts_classify_rest_search_and_graphql(mocker):
+    mocker.patch.object(
+        github.subprocess,
+        "run",
+        return_value=mocker.Mock(returncode=0, stdout="[]", stderr=""),
+    )
+    github.reset_call_counts()
+    github._run(["gh", "api", "repos/o/r/pulls/1"], capture_output=True, text=True)
+    github._run(
+        ["gh", "api", "search/issues", "--method", "GET"],
+        capture_output=True,
+        text=True,
+    )
+    github._run(
+        ["gh", "api", "graphql", "-f", "query=x"], capture_output=True, text=True
+    )
+    assert github.call_counts() == {"rest": 1, "search": 1, "graphql": 1}
+    github.reset_call_counts()
+    assert github.call_counts() == {"rest": 0, "search": 0, "graphql": 0}

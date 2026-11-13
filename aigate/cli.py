@@ -37,6 +37,7 @@ from .gate import (
 from .gateconfig import GATE_CONFIG_PATH, load_gate_config
 from .ledger import dispose
 from .policy import GatePolicy, PolicyError
+from .render import safe_inline
 from .reviewers import ConfigError
 from .tiers import classify
 
@@ -201,8 +202,15 @@ def _with_open_findings(
         return dataclasses.replace(
             decision, summary=decision.summary.replace(FIX_FINDINGS_STEP, step, 1)
         )
+    # The path is the pull request's (a fork's, under pull_request_target):
+    # rendered through aigate.render so it cannot close the link or the
+    # comment's Markdown.
     shown = [
-        f"- [{f.path or 'comment'}]({f.url})" if f.url else f"- {f.path or 'comment'}"
+        (
+            f"- [{safe_inline(f.path) if f.path else 'comment'}]({f.url})"
+            if f.url
+            else f"- {safe_inline(f.path) if f.path else 'comment'}"
+        )
         for f in open_[:10]
     ]
     if len(open_) > 10:
@@ -296,12 +304,21 @@ def _tied_to_this_pull(
     )
 
 
+class _Unread:
+    """Marker for "``evaluate`` reads the config itself" (``None`` means absent)."""
+
+
+UNREAD = _Unread()
+
+
 def evaluate(
     slug: str,
     pull: github.PullRef,
     reviewer_login: str,
     *,
     human_fallback: bool = True,
+    gate_text: str | _Unread | None = UNREAD,
+    signals: list[Signal] | None = None,
 ) -> Decision:
     """Decide the gate for ``pull``: the one verdict every mode reports.
 
@@ -309,13 +326,21 @@ def evaluate(
     AI review. A consumer that must act on a clean AI review only can turn it
     off.
 
+    ``gate_text`` is ``.github/ai-gate.yml`` as already read from the BASE
+    branch (``None`` if absent), for a caller that needs the same file for its
+    own checks and should not read it twice. Left unset, it is read here.
+    ``signals`` are the head's check runs as already read by such a caller
+    (the approver's proof step); left unset, they are read here. Either way
+    the same rule decides.
+
     Configuration and GitHub read failures become a FAILURE decision instead of
     raising, so the enforcing caller always posts a red check. A bare exit
     would leave any earlier green check on this head SHA in place.
     """
     # A malformed or unreadable config fails closed.
     try:
-        gate_text = github.read_config_text(slug, pull.base_ref, GATE_CONFIG_PATH)
+        if isinstance(gate_text, _Unread):
+            gate_text = github.read_config_text(slug, pull.base_ref, GATE_CONFIG_PATH)
         required, policy = load_gate_config(gate_text)
     except (ConfigError, PolicyError) as exc:
         return _failed(
@@ -328,7 +353,8 @@ def evaluate(
         return _failed(f"could not read the gate configuration — {exc}")
 
     try:
-        signals = github.signals_for(slug, pull.head_sha)
+        if signals is None:
+            signals = github.signals_for(slug, pull.head_sha)
         opened_at = _opened_at(slug, pull)
     except github.GitHubError as exc:
         return _failed(f"could not read the AI review — {exc}")
@@ -555,6 +581,15 @@ def _reviewer_has_posted(slug: str, pull: github.PullRef) -> bool:
     )
 
 
+# How a stopped gate run gets another go without a push: the approver
+# re-runs it once the review lands (ai-gate-approver, gate_rerun.py), and the
+# bot command asks it to look now.
+AUTO_RERUN_NOTE = (
+    "The bot re-runs this gate automatically when you mark the pull request "
+    "ready or the review lands; or comment `/ai-gate check`."
+)
+
+
 def _draft_decision() -> Decision:
     return Decision(
         outcome=PENDING,
@@ -563,8 +598,7 @@ def _draft_decision() -> Decision:
             "- Cursor Bugbot does not review draft pull requests, so the gate "
             "cannot pass yet.\n\n**What to do:**\n"
             "- Mark the pull request **Ready for review**. Bugbot then reviews it.\n"
-            "- Then re-run the gate. Marking it ready does not re-run the gate by "
-            "itself (GitHub only re-runs it on a push)."
+            f"- {AUTO_RERUN_NOTE}"
         ),
     )
 
@@ -578,8 +612,8 @@ def _with_rerun_hint(decision: Decision, wait_seconds: int) -> Decision:
     notes = []
     if decision.outcome == PENDING and wait_seconds > 0:
         notes.append(
-            f"The gate stopped waiting after {wait_seconds // 60} minutes. Once the "
-            f"review finishes, re-run the gate."
+            f"The gate stopped waiting after {wait_seconds // 60} minutes. "
+            f"{AUTO_RERUN_NOTE}"
         )
     server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
     repo, run = os.environ.get("GITHUB_REPOSITORY"), os.environ.get("GITHUB_RUN_ID")
@@ -730,8 +764,13 @@ def _post_gate_check(
     """Post the gate's verdict as a check-run on the head commit (best effort).
 
     A ``GitHubError`` is logged, not raised; the exit code still reflects the
-    decision.
+    decision. ``AIGATE_POST_CHECK_RUN=false`` (the action's ``post-check-run``
+    input) skips it: the org-required workflow has no ``checks: write``, its
+    job status is the gate, and the post only produced a misleading "could not
+    post … 403" line on every run.
     """
+    if os.environ.get("AIGATE_POST_CHECK_RUN", "").strip().lower() == "false":
+        return
     status, conclusion = _CHECK_STATE[outcome]
     try:
         github.post_check_run(

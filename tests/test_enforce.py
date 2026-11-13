@@ -757,3 +757,33 @@ def test_without_security_reviewers_an_outdated_owner_resolution_is_red(mocker):
     )
     assert cli.main(["gate"]) == 1
     assert _posted(post) == ("completed", "failure")
+
+
+def test_a_team_the_token_cannot_read_is_a_verdict_not_a_retry(mocker):
+    # Reading @example-org/payments-owners 403s (no read:org). Nothing a re-run
+    # does changes that, so the gate says so and offers no re-run; a consumer
+    # sees a non-transient decision instead of retrying it into a loop.
+    post = _setup(
+        mocker,
+        policy=POLICY,
+        paths=["src/payments/charge.py"],
+        reviews=[
+            {"user": {"login": "reviewer"}, "state": "APPROVED", "commit_id": HEAD}
+        ],
+    )
+    mocker.patch.object(
+        github,
+        "team_members",
+        side_effect=github.GitHubRefusalError(
+            "cannot read the members of @example-org/payments-owners: the token "
+            "cannot read organisation membership (needs read:org; HTTP 403)"
+        ),
+    )
+    assert cli.main(["gate"]) == 1
+    assert _posted(post) == ("completed", "failure")
+    body = github.create_issue_comment.call_args.args[2]  # type: ignore[attr-defined]
+    assert "read:org" in body
+    assert "Re-run the gate" not in body
+    pull = github.PullRef(1, HEAD, "main", OPENED)
+    decision = cli.evaluate("example-org/r", pull, "cursor[bot]")
+    assert decision.transient is False and decision.rerun_helps is False

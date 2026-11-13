@@ -39,6 +39,7 @@ from .codeowners import is_eligible_resolver
 from .gate import FAILURE, PENDING, SUCCESS, Decision
 from .ledger import Disposition, FindingVerdict
 from .policy import GatePolicy
+from .render import safe_inline
 from .threads import ObservedFinding
 from .tiers import TierResult
 
@@ -154,15 +155,18 @@ def requirements_for(
 
     for finding, verdict in zip(findings, verdicts, strict=True):
         where = finding.path or "(no path)"
+        # The path is the pull request's: every sink renders it through
+        # aigate.render (stdout, step summary, comment).
+        shown = safe_inline(where)
         state = state_of(verdict)
         if state is State.UNRESOLVED:
-            waiting.append(f"{where}: finding still open")
+            waiting.append(f"{shown}: finding still open")
         elif state is State.DISMISSED:
             req = _dismissal_requirement(policy, where)
             if req is not None:
                 add(req)
             elif not verdict.is_green:
-                problems.append(f"{where}: finding dismissed — {verdict.reason}")
+                problems.append(f"{shown}: finding dismissed — {verdict.reason}")
 
     if tier_result.requires_human_always:
         add(
@@ -192,7 +196,10 @@ def _escalation_requirements(
             if approver not in seen:
                 seen.add(approver)
                 reqs.append(
-                    Requirement(approver, f"{path}: {kind} on an escalation path")
+                    Requirement(
+                        approver,
+                        f"{safe_inline(path)}: {kind} on an escalation path",
+                    )
                 )
 
     for finding in findings:
@@ -207,7 +214,8 @@ def _dismissal_requirement(policy: GatePolicy, where: str) -> Requirement | None
     if not policy.security_dismissal_reviewers:
         return None
     return Requirement(
-        policy.security_dismissal_reviewers, f"{where}: finding dismissed, not fixed"
+        policy.security_dismissal_reviewers,
+        f"{safe_inline(where)}: finding dismissed, not fixed",
     )
 
 
@@ -228,7 +236,7 @@ def evaluate(
     lines = [f"Risk tier {tier_result.tier}: {'; '.join(tier_result.reasons)}"]
     lines.append(f"Reviewer findings: {len(findings)}")
     for finding, verdict in zip(findings, verdicts, strict=True):
-        where = finding.path or "(no path)"
+        where = safe_inline(finding.path or "(no path)")
         who = f" by {finding.resolved_by_login}" if finding.resolved_by_login else ""
         lines.append(
             f"- [{state_of(verdict).value}] {where}: {verdict.reason}"

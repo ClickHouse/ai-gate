@@ -46,7 +46,32 @@ class PullRef:
 GH_TIMEOUT_SECONDS = 60
 
 
+# How many GitHub calls this process made, by budget: REST (the installation's
+# shared hourly budget), the Search API (its own, much smaller one) and
+# GraphQL (points). Every `gh` call goes through ``_run``, so this is exact.
+_calls = {"rest": 0, "search": 0, "graphql": 0}
+
+
+def _classify(cmd: list[str]) -> str:
+    if "graphql" in cmd:
+        return "graphql"
+    if any(isinstance(a, str) and a.startswith("search/") for a in cmd):
+        return "search"
+    return "rest"
+
+
+def call_counts() -> dict[str, int]:
+    """Return a copy of the per-budget call counts since the last reset."""
+    return dict(_calls)
+
+
+def reset_call_counts() -> None:
+    for key in _calls:
+        _calls[key] = 0
+
+
 def _run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess[str]:
+    _calls[_classify(cmd)] += 1
     try:
         return subprocess.run(cmd, timeout=GH_TIMEOUT_SECONDS, **kwargs)
     except subprocess.TimeoutExpired as exc:
@@ -319,9 +344,20 @@ def team_members(org: str, team_slug: str) -> frozenset[str]:
 
     Needs a token that can read org membership. The default ``GITHUB_TOKEN``
     cannot, so the error propagates and the gate fails closed rather than
-    treating the team as empty.
+    treating the team as empty. A 403 is a ``GitHubRefusalError``: the token
+    will not grow read:org on a retry, so a consumer must treat it as a
+    verdict, not a transient failure to retry (the approver once retried it
+    five times into its dead-letter queue).
     """
-    members = _gh_list(f"orgs/{org}/teams/{team_slug}/members")
+    try:
+        members = _gh_list(f"orgs/{org}/teams/{team_slug}/members")
+    except GitHubError as exc:
+        if _is_forbidden(exc):
+            raise GitHubRefusalError(
+                f"cannot read the members of @{org}/{team_slug}: the token cannot "
+                f"read organisation membership (needs read:org; {exc})"
+            ) from exc
+        raise
     return frozenset(
         m["login"].lower() for m in members if isinstance(m, dict) and m.get("login")
     )
@@ -415,6 +451,12 @@ def signals_for(slug: str, sha: str) -> list[Signal]:
 # Fail closed at the cap so a sensitive path cannot hide behind padding files.
 _FILES_API_CAP = 3000
 
+# The policy (`_enforce`) and the approver's trust-root floor both need the
+# file list of the same pull request in the same run; read it once. Short-lived
+# on purpose, and a refusal or failure is never cached.
+_CHANGED_PATHS_TTL_SECONDS = 120
+_changed_paths_cache: dict[tuple[str, int], tuple[float, list[str]]] = {}
+
 
 def changed_paths(slug: str, pr_number: int) -> list[str]:
     """Return the paths a pull request changes, for risk tiering.
@@ -422,7 +464,18 @@ def changed_paths(slug: str, pr_number: int) -> list[str]:
     An unreadable, truncated or malformed response fails closed rather than
     returning a short list that would tier too low. Renames return both the new
     and the previous name, so renaming a sensitive file does not escape the tier.
+    Memoised for ``_CHANGED_PATHS_TTL_SECONDS`` per (repo, number).
     """
+    key = (slug, pr_number)
+    cached = _changed_paths_cache.get(key)
+    if cached is not None and time.monotonic() - cached[0] < _CHANGED_PATHS_TTL_SECONDS:
+        return list(cached[1])
+    paths = _read_changed_paths(slug, pr_number)
+    _changed_paths_cache[key] = (time.monotonic(), list(paths))
+    return paths
+
+
+def _read_changed_paths(slug: str, pr_number: int) -> list[str]:
     data = gh_json([f"repos/{slug}/pulls/{pr_number}/files", "--paginate", "--slurp"])
     if not isinstance(data, list):
         raise GitHubError(
@@ -632,6 +685,25 @@ def _is_missing(exc: Exception) -> bool:
     _, _, stderr = message.partition(" failed: ")
     haystack = stderr if stderr else message
     return any(marker in haystack for marker in _MISSING_COMMIT)
+
+
+# Markers meaning "this token may not read that", which no retry changes. A
+# 403 that is throttling — a primary rate limit ("API rate limit exceeded"),
+# a secondary one ("exceeded a secondary rate limit") or GitHub's older
+# "abuse detection mechanism" wording — is the opposite: a retry is exactly
+# what clears it, so it is never a refusal.
+_FORBIDDEN = ("HTTP 403", "Resource not accessible", "Must have admin rights")
+_THROTTLED = ("rate limit", "secondary rate", "abuse detection")
+
+
+def _is_forbidden(exc: Exception) -> bool:
+    message = str(exc)
+    _, _, stderr = message.partition(" failed: ")
+    haystack = stderr if stderr else message
+    lowered = haystack.lower()
+    if any(marker in lowered for marker in _THROTTLED):
+        return False
+    return any(marker in haystack for marker in _FORBIDDEN)
 
 
 def pull_detail(slug: str, pr_number: int) -> dict | None:

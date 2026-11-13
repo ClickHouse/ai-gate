@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from aigate.gate import FAILURE, PENDING, SUCCESS, Signal, decide
-from aigate.reviewers import REVIEWERS
+from aigate.gate import FAILURE, PENDING, SUCCESS, Signal, all_required_green, decide
+from aigate.reviewers import REVIEWERS, Reviewer
 
 BUGBOT = REVIEWERS["bugbot"].app_slug
 BUGBOT_NAME = REVIEWERS["bugbot"].check_name
@@ -127,3 +127,72 @@ def test_a_missing_review_says_how_to_trigger_one():
     assert "has not posted a review" in d.summary
     assert "`bugbot run`" in d.summary
     assert "not enabled for this repository" in d.summary
+
+
+class TestAllRequiredGreen:
+    """The yes/no the approver's proof step and backstop use: same rule as decide()."""
+
+    def _polyglot(self):
+        return Reviewer("polyglot", "Polyglot", "polyglot-ai", "Polyglot review")
+
+    def _signal(self, rv, conclusion, completed_at="2026-01-01T00:00:00Z"):
+        return Signal(
+            app_slug=rv.app_slug,
+            name=rv.check_name,
+            conclusion=conclusion,
+            completed_at=None if conclusion == PENDING else completed_at,
+        )
+
+    def test_one_reviewer_green(self):
+        bugbot = REVIEWERS["bugbot"]
+        assert all_required_green(["bugbot"], [self._signal(bugbot, SUCCESS)]) == (
+            True,
+            [],
+        )
+
+    def test_missing_pending_and_failed_are_named(self, mocker):
+        mocker.patch.dict(REVIEWERS, {"polyglot": self._polyglot()})
+        bugbot, poly = REVIEWERS["bugbot"], REVIEWERS["polyglot"]
+        assert all_required_green(["bugbot", "polyglot"], []) == (
+            False,
+            ["Cursor Bugbot (missing)", "Polyglot (missing)"],
+        )
+        ok, waiting = all_required_green(
+            ["bugbot", "polyglot"],
+            [self._signal(bugbot, SUCCESS), self._signal(poly, PENDING)],
+        )
+        assert (ok, waiting) == (False, ["Polyglot (pending)"])
+        ok, waiting = all_required_green(
+            ["bugbot", "polyglot"],
+            [self._signal(bugbot, "neutral"), self._signal(poly, SUCCESS)],
+        )
+        assert (ok, waiting) == (False, ["Cursor Bugbot (neutral)"])
+
+    def test_both_green_is_green(self, mocker):
+        mocker.patch.dict(REVIEWERS, {"polyglot": self._polyglot()})
+        bugbot, poly = REVIEWERS["bugbot"], REVIEWERS["polyglot"]
+        assert all_required_green(
+            ["bugbot", "polyglot"],
+            [self._signal(bugbot, SUCCESS), self._signal(poly, SUCCESS)],
+        ) == (True, [])
+
+    def test_the_latest_completed_run_decides_like_decide(self):
+        bugbot = REVIEWERS["bugbot"]
+        signals = [
+            self._signal(bugbot, "neutral", "2026-01-01T00:00:00Z"),
+            self._signal(bugbot, SUCCESS, "2026-01-02T00:00:00Z"),  # the re-run
+        ]
+        assert all_required_green(["bugbot"], signals) == (True, [])
+        assert decide(["bugbot"], signals).outcome == SUCCESS
+        signals.append(self._signal(bugbot, PENDING))  # a run in progress
+        assert all_required_green(["bugbot"], signals)[0] is False
+        assert decide(["bugbot"], signals).outcome == PENDING
+
+    def test_a_check_from_an_unregistered_app_counts_for_nothing(self):
+        forged = Signal(
+            app_slug="some-other-app", name="Cursor Bugbot", conclusion=SUCCESS
+        )
+        assert all_required_green(["bugbot"], [forged]) == (
+            False,
+            ["Cursor Bugbot (missing)"],
+        )

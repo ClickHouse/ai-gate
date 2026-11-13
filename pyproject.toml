@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-gate"
-version = "0.1.6"
+version = "0.1.7"
 description = "Block merge until a pull request has a clean AI review (default: Cursor Bugbot)"
 requires-python = ">=3.11"
 license = "Apache-2.0"
@@ -14,7 +14,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-    "black==26.10.1",
+    "black==26.5.1",
     "mypy==2.4.1",
     "pytest==9.0.3",
     "pytest-mock==3.14.0",

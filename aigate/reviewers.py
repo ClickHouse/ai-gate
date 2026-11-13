@@ -22,6 +22,13 @@ class ConfigError(ValueError):
     """The repository's ai-gate.yml is malformed or names an unknown reviewer."""
 
 
+# Apps whose check runs any workflow in the repository can post, so a check
+# "from" them proves nothing about who reviewed: never a reviewer identity.
+# `github-actions` is the GITHUB_TOKEN; a bespoke reviewer must be its own
+# GitHub App with its own slug, added here through a security-reviewed change.
+FORBIDDEN_REVIEWER_APP_SLUGS = frozenset({"github-actions"})
+
+
 @dataclass(frozen=True)
 class Reviewer:
     key: str
@@ -54,6 +61,13 @@ class Reviewer:
     it may still be required, but should not trigger an automatic approval.
     Defaults to False, so a new reviewer is never eligible by accident.
     """
+
+    def __post_init__(self) -> None:
+        if self.app_slug in FORBIDDEN_REVIEWER_APP_SLUGS:
+            raise ValueError(
+                f"reviewer {self.key!r}: app slug {self.app_slug!r} is not a "
+                f"reviewer identity (any workflow can post as it)"
+            )
 
 
 # Reviewers a repository may require. The set is closed on purpose: an unknown

@@ -20,3 +20,8 @@ def _review_is_this_pull_requests(request, mocker):
 @pytest.fixture(autouse=True)
 def _fresh_shared_commit_cache():
     github._shared_commit_cache.clear()
+
+
+@pytest.fixture(autouse=True)
+def _fresh_changed_paths_cache():
+    github._changed_paths_cache.clear()
