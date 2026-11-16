@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from functools import cache
 
 from .render import safe_inline
+from .trust import load_trust_policy
 
 # Tiers, low to high. The numbers are ordinal; compare with ``max``.
 TIER_0 = 0  # documentation-like; lowest consequence
@@ -37,72 +38,17 @@ class Rule:
     capability: str  # human-readable reason, surfaced in the decision
 
 
-# Order is for readability only; the classifier takes the max. Globs match the
-# full repo-relative path with the semantics described in ``_compile``.
-SENSITIVITY_MAP: tuple[Rule, ...] = (
-    # --- Trust root: the things that govern the rules themselves (TIER_3) ---
-    Rule(".github/workflows/**", TIER_3, "CI/CD workflow (runs with repo privileges)"),
-    Rule(".github/actions/**", TIER_3, "composite action (runs with repo privileges)"),
-    # Repository control plane, including CODEOWNERS and the gate's own config.
-    Rule(".github/**", TIER_3, "repository control plane (.github config)"),
-    # Instructions the AI reviewer reads, at any depth: a pull request that
-    # edits them can steer its own review.
-    Rule("**/.cursor/**", TIER_3, "AI reviewer instructions (.cursor)"),
-    Rule("**/BUGBOT.md", TIER_3, "AI reviewer instructions (BUGBOT.md)"),
-    Rule("**/.cursorrules", TIER_3, "AI reviewer instructions (.cursorrules)"),
-    Rule("atlantis.yaml", TIER_3, "Atlantis config"),
-    Rule("atlantis*/**", TIER_3, "Atlantis config"),
-    Rule("**/atlantis.yaml", TIER_3, "Atlantis config"),
-    Rule("**/CODEOWNERS", TIER_3, "code ownership / review routing"),
-    Rule(".github/CODEOWNERS", TIER_3, "code ownership / review routing"),
-    Rule("**/*.tf", TIER_3, "infrastructure as code (Terraform)"),
-    Rule("**/*.tfvars", TIER_3, "infrastructure as code (Terraform vars)"),
-    Rule("infra/**", TIER_3, "infrastructure as code"),
-    Rule("**/Dockerfile", TIER_3, "container build (base image, runtime)"),
-    # Build files run arbitrary commands. CMakeLists.txt would otherwise match
-    # the ``*.txt`` documentation rule.
-    Rule("**/CMakeLists.txt", TIER_3, "build system (CMake)"),
-    Rule("**/*.cmake", TIER_3, "build system (CMake)"),
-    Rule("**/Makefile", TIER_3, "build system (Make)"),
-    Rule("**/*.mk", TIER_3, "build system (Make)"),
-    # --- Sensitive capabilities (TIER_3) ---
-    Rule("**/auth/**", TIER_3, "authentication / authorisation"),
-    Rule("**/authz/**", TIER_3, "authorisation"),
-    Rule("**/crypto/**", TIER_3, "cryptography"),
-    Rule("**/*secret*", TIER_3, "secret handling"),
-    Rule("**/migrations/**", TIER_3, "database migration"),
-    Rule("**/*.rego", TIER_3, "policy as code (OPA)"),
-    # --- Elevated (TIER_2) ---
-    Rule("**/package.json", TIER_2, "dependency manifest"),
-    Rule("**/package-lock.json", TIER_2, "dependency lockfile"),
-    Rule("**/requirements*.txt", TIER_2, "dependency manifest"),
-    Rule("**/pyproject.toml", TIER_2, "dependency manifest"),
-    Rule("**/go.mod", TIER_2, "dependency manifest"),
-    Rule("**/go.sum", TIER_2, "dependency lockfile"),
-    Rule("**/Cargo.toml", TIER_2, "dependency manifest"),
-    Rule("**/Cargo.lock", TIER_2, "dependency lockfile"),
-    # --- Tests (TIER_1): a test change can weaken the review oracle ---
-    Rule("**/test_*.py", TIER_1, "test (affects the review oracle)"),
-    Rule("**/*_test.go", TIER_1, "test (affects the review oracle)"),
-    Rule("**/tests/**", TIER_1, "test (affects the review oracle)"),
-    # --- Known ordinary code areas (TIER_1): not free, but not sensitive ---
-    # Extend as areas are vetted. Unmatched paths get UNKNOWN_PATH_TIER.
-    Rule("src/**", TIER_1, "ordinary application code"),
-    Rule("app/**", TIER_1, "ordinary application code"),
-    Rule("lib/**", TIER_1, "ordinary application code"),
-    Rule("pkg/**", TIER_1, "ordinary application code"),
-    Rule("cmd/**", TIER_1, "ordinary application code"),
-    Rule("internal/**", TIER_1, "ordinary application code"),
-    Rule("services/**", TIER_1, "ordinary application code"),
-    # --- Documentation-like (TIER_0) ---
-    Rule("**/*.md", TIER_0, "documentation"),
-    Rule("**/*.txt", TIER_0, "documentation"),
-    Rule("**/LICENSE", TIER_0, "licence"),
+# The rules live in ``trust_policy.yaml`` (``aigate.trust``), the one place the
+# gate's path policy is written down. Order there is for readability only; the
+# classifier takes the max. Globs use the dialect described in ``_compile``.
+_POLICY = load_trust_policy()
+SENSITIVITY_MAP: tuple[Rule, ...] = tuple(
+    Rule(r.glob, r.tier, r.why) for r in _POLICY.tier_rules
 )
 
 # Tier of a path no rule matches. Lowering an area is a deliberate edit to
-# SENSITIVITY_MAP, never a default.
-UNKNOWN_PATH_TIER = TIER_2
+# the policy file, never a default.
+UNKNOWN_PATH_TIER = _POLICY.unknown_path_tier
 
 # Tier of a path matched only by an ordinary-code rule.
 ORDINARY_CODE_TIER = TIER_1

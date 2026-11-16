@@ -82,3 +82,31 @@ def test_eligibility_is_case_insensitive() -> None:
 
 def test_non_owner_is_not_eligible() -> None:
     assert not is_eligible_resolver(("@alice",), "mallory", frozenset())
+
+
+# --- GitHub's semantics the approver's code-owner check relies on (review R6) --
+
+
+def test_a_trailing_wildcard_matches_direct_children_only() -> None:
+    rules = parse(".github/* @alice\n")
+    assert owners_for_path(rules, ".github/dependabot.yml") == ("@alice",)
+    assert owners_for_path(rules, ".github/workflows/deploy.yml") == ()
+
+
+def test_a_plain_directory_name_matches_beneath_it() -> None:
+    rules = parse("/.github @alice\n/docs/ @bob\n")
+    assert owners_for_path(rules, ".github/workflows/x.yml") == ("@alice",)
+    assert owners_for_path(rules, "docs/a/b.md") == ("@bob",)
+
+
+def test_a_later_ownerless_line_unowns_the_path() -> None:
+    rules = parse("* @alice\n.github/workflows/deploy.yml\n")
+    assert owners_for_path(rules, ".github/workflows/deploy.yml") == ()
+    assert owners_for_path(rules, "src/a.py") == ("@alice",)
+
+
+def test_a_later_email_owner_wins_and_matches_no_login() -> None:
+    rules = parse("* @alice\n/.github/ ops@example.com\n")
+    owners = owners_for_path(rules, ".github/workflows/x.yml")
+    assert owners == ("ops@example.com",)
+    assert not is_eligible_resolver(owners, "alice", frozenset())

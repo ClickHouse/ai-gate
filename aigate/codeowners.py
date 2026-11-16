@@ -3,11 +3,16 @@
 Pure: the caller fetches CODEOWNERS from the base branch and resolves team
 memberships.
 
-Supports the common gitignore-style subset: a leading ``/`` anchors to the
-root, a trailing ``/`` matches a directory and its contents, ``*`` matches
-within a segment, ``**`` across segments, and a pattern without a slash matches
-in any directory. The last matching rule wins. Character classes are not
-supported.
+Supports the common gitignore-style subset GitHub uses: a leading ``/``
+anchors to the root, as does a slash inside the pattern; a trailing ``/``
+matches a directory and its contents; ``*`` matches within one segment and
+``**`` across segments; a pattern without a slash matches in any directory.
+A pattern whose last segment is a plain name (``/docs``) also matches what is
+beneath it; one ending in a wildcard (``docs/*``) matches only direct
+children. The last matching rule wins, including a rule with no owners, which
+leaves the path unowned. Owners are kept as written (``@user``,
+``@org/team`` or an email address; an email never matches a login).
+Character classes are not supported.
 """
 
 from __future__ import annotations
@@ -20,7 +25,7 @@ from functools import cache
 @dataclass(frozen=True)
 class Rule:
     pattern: str
-    owners: tuple[str, ...]  # e.g. ("@alice", "@org/team")
+    owners: tuple[str, ...]  # e.g. ("@alice", "@org/team"); () = unowned
 
 
 def parse(text: str) -> list[Rule]:
@@ -31,9 +36,9 @@ def parse(text: str) -> list[Rule]:
         if not line:
             continue
         parts = line.split()
-        pattern, owners = parts[0], tuple(p for p in parts[1:] if p.startswith("@"))
-        if owners:
-            rules.append(Rule(pattern=pattern, owners=owners))
+        # Kept even without owners: a later ownerless (or email-only) line
+        # still wins over an earlier one for the paths it matches.
+        rules.append(Rule(pattern=parts[0], owners=tuple(parts[1:])))
     return rules
 
 
@@ -66,8 +71,10 @@ def _compile(pattern: str) -> re.Pattern[str]:
 
     # A pattern with no internal slash matches in any directory.
     prefix = "" if anchored or "/" in p else "(?:.*/)?"
-    # A directory pattern (or any match) also matches everything beneath it.
-    suffix = "(?:/.*)?"
+    # A directory pattern, or one whose last segment is a plain name, also
+    # matches everything beneath it; `docs/*` matches only direct children.
+    last = p.rsplit("/", 1)[-1]
+    suffix = "(?:/.*)?" if dir_only or not any(c in last for c in "*?") else ""
     return re.compile("^" + prefix + body + suffix + "$")
 
 

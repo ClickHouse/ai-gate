@@ -1,0 +1,123 @@
+# The AI review gate's trust policy: which changed paths carry which risk, and
+# which ones the approver never approves on its own.
+#
+# This file ships inside the `aigate` package and is the ONLY place these lists
+# live (aigate.trust loads and validates it; aigate.tiers and the approver's
+# guardrails read it). It is not configurable per repository on purpose: a
+# repository's own `.github/ai-gate.yml` can ADD sign-off (`policy:
+# escalation_paths`) but cannot lower anything here. A change to this file is
+# a change to the gate's security policy and is reviewed as one.
+#
+# Glob dialect (aigate.tiers.path_matches), over repo-relative paths:
+#   `**/` zero or more directories · `**` anything · `*` within one segment ·
+#   `?` one character.
+version: 1
+
+# --- Risk tiers (aigate.tiers) ----------------------------------------------
+# A pull request's tier is the MAX over its changed paths; nothing lowers it.
+#   0  documentation-like
+#   1  ordinary code and tests (review coverage, no human by default)
+#   2  elevated: dependencies, and any path no rule matches
+#   3  trust root / sensitive capability: a human always signs off
+# Under a repository `policy:` block, tier 3 always needs a human approval.
+tiers:
+  unknown_path: 2
+  rules:
+    # Trust root: the things that govern the rules themselves.
+    - { glob: ".github/workflows/**", tier: 3, why: "CI/CD workflow (runs with repo privileges)" }
+    - { glob: ".github/actions/**", tier: 3, why: "composite action (runs with repo privileges)" }
+    - { glob: ".github/**", tier: 3, why: "repository control plane (.github config)" }
+    # Instructions the AI reviewer reads, at any depth: a pull request that
+    # edits them can steer its own review.
+    - { glob: "**/.cursor/**", tier: 3, why: "AI reviewer instructions (.cursor)" }
+    - { glob: "**/BUGBOT.md", tier: 3, why: "AI reviewer instructions (BUGBOT.md)" }
+    - { glob: "**/.cursorrules", tier: 3, why: "AI reviewer instructions (.cursorrules)" }
+    - { glob: "atlantis.yaml", tier: 3, why: "Atlantis config" }
+    - { glob: "atlantis*/**", tier: 3, why: "Atlantis config" }
+    - { glob: "**/atlantis.yaml", tier: 3, why: "Atlantis config" }
+    - { glob: "**/CODEOWNERS", tier: 3, why: "code ownership / review routing" }
+    - { glob: ".github/CODEOWNERS", tier: 3, why: "code ownership / review routing" }
+    - { glob: "**/*.tf", tier: 3, why: "infrastructure as code (Terraform)" }
+    - { glob: "**/*.tfvars", tier: 3, why: "infrastructure as code (Terraform vars)" }
+    - { glob: "infra/**", tier: 3, why: "infrastructure as code" }
+    - { glob: "**/Dockerfile", tier: 3, why: "container build (base image, runtime)" }
+    # Build files run arbitrary commands. CMakeLists.txt would otherwise match
+    # the `*.txt` documentation rule.
+    - { glob: "**/CMakeLists.txt", tier: 3, why: "build system (CMake)" }
+    - { glob: "**/*.cmake", tier: 3, why: "build system (CMake)" }
+    - { glob: "**/Makefile", tier: 3, why: "build system (Make)" }
+    - { glob: "**/*.mk", tier: 3, why: "build system (Make)" }
+    # Sensitive capabilities.
+    - { glob: "**/auth/**", tier: 3, why: "authentication / authorisation" }
+    - { glob: "**/authz/**", tier: 3, why: "authorisation" }
+    - { glob: "**/crypto/**", tier: 3, why: "cryptography" }
+    - { glob: "**/*secret*", tier: 3, why: "secret handling" }
+    - { glob: "**/migrations/**", tier: 3, why: "database migration" }
+    - { glob: "**/*.rego", tier: 3, why: "policy as code (OPA)" }
+    # Elevated.
+    - { glob: "**/package.json", tier: 2, why: "dependency manifest" }
+    - { glob: "**/package-lock.json", tier: 2, why: "dependency lockfile" }
+    - { glob: "**/requirements*.txt", tier: 2, why: "dependency manifest" }
+    - { glob: "**/pyproject.toml", tier: 2, why: "dependency manifest" }
+    - { glob: "**/go.mod", tier: 2, why: "dependency manifest" }
+    - { glob: "**/go.sum", tier: 2, why: "dependency lockfile" }
+    - { glob: "**/Cargo.toml", tier: 2, why: "dependency manifest" }
+    - { glob: "**/Cargo.lock", tier: 2, why: "dependency lockfile" }
+    # Tests: a test change can weaken the review oracle.
+    - { glob: "**/test_*.py", tier: 1, why: "test (affects the review oracle)" }
+    - { glob: "**/*_test.go", tier: 1, why: "test (affects the review oracle)" }
+    - { glob: "**/tests/**", tier: 1, why: "test (affects the review oracle)" }
+    # Known ordinary code areas: not free, but not sensitive. Extend as areas
+    # are vetted; anything unmatched gets `unknown_path`.
+    - { glob: "src/**", tier: 1, why: "ordinary application code" }
+    - { glob: "app/**", tier: 1, why: "ordinary application code" }
+    - { glob: "lib/**", tier: 1, why: "ordinary application code" }
+    - { glob: "pkg/**", tier: 1, why: "ordinary application code" }
+    - { glob: "cmd/**", tier: 1, why: "ordinary application code" }
+    - { glob: "internal/**", tier: 1, why: "ordinary application code" }
+    - { glob: "services/**", tier: 1, why: "ordinary application code" }
+    # Documentation-like.
+    - { glob: "**/*.md", tier: 0, why: "documentation" }
+    - { glob: "**/*.txt", tier: 0, why: "documentation" }
+    - { glob: "**/LICENSE", tier: 0, why: "licence" }
+
+# --- The approver's floor (aigate_approver.guardrails) ------------------------
+# Paths the approver never approves by itself, however green the gate is: the
+# files that configure the gate, its CI, its ownership and its reviewer. A bot
+# approving these is the gate approving changes to itself. Matched
+# case-insensitively. Everything else that should need a human is the
+# repository's call (`policy: escalation_paths` in its .github/ai-gate.yml).
+#
+# `unless` names the checks, any one of which clears a match (Bugbot must be
+# green either way, as for every approval):
+#   codeowner_author       the pull request's author is a code owner of the
+#                          file, by the base branch's CODEOWNERS (a user
+#                          handle, or a team the approver can read);
+#   maintainer_author      the pull request's author has the Maintain or Admin
+#                          role on the repository.
+# Both author checks also need every commit in the pull request to be the
+# author's own: authored and committed by their account and
+# signature-verified, so nobody else's push rides on their trust.
+# A rule without `unless` is never cleared: the gate's own config, CODEOWNERS
+# (an owner could make themselves owner of everything) and the reviewer's
+# instructions always need a human.
+approver:
+  always_human:
+    - { glob: ".github/workflows/**", why: "CI/CD workflow", unless: [codeowner_author, maintainer_author] }
+    - { glob: ".github/actions/**", why: "composite action", unless: [codeowner_author, maintainer_author] }
+    - { glob: ".github/ai-gate.yml*", why: "the gate's own config" }
+    - { glob: ".github/ai-reviewers.yml*", why: "the gate's reviewer config" }
+    - { glob: "**/.cursor/**", why: "AI reviewer instructions" }
+    - { glob: "**/CODEOWNERS", why: "code ownership" }
+    - { glob: "**/.cursorrules", why: "AI reviewer instructions" }
+    - { glob: "**/BUGBOT.md", why: "AI reviewer instructions" }
+
+  # Repository roles (`role_name`) that count for `maintainer_author`. A
+  # custom role never does, whatever it is based on: its name says nothing the
+  # approver can check.
+  maintainer_roles: [maintain, admin]
+
+  # A reviewer-declared risk in the pull request body at these levels blocks.
+  # Advisory only (the body is author-editable): it can stop the honest case,
+  # never be used to force an approval.
+  blocking_risk: [high, critical]

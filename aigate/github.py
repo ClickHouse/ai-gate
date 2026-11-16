@@ -12,6 +12,7 @@ import json
 import os
 import subprocess
 import time
+import urllib.parse
 from dataclasses import dataclass
 
 from .gate import PENDING, SUCCESS, Signal
@@ -298,7 +299,9 @@ def read_config_text(slug: str, base_ref: str, path: str) -> str | None:
         [
             "gh",
             "api",
-            f"repos/{slug}/contents/{path}",
+            # Encoded: a `#`, `?` or `%` in a file name must never turn the
+            # request into a different file (or drop the `ref`).
+            f"repos/{slug}/contents/{urllib.parse.quote(path, safe='/')}",
             "--method",
             "GET",
             "-f",

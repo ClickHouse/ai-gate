@@ -165,3 +165,22 @@ def test_a_permission_403_is_still_a_refusal():
         "HTTP 403: Forbidden",
     ):
         assert github._is_forbidden(_realistic_error("orgs/o/teams/t/members", stderr))
+
+
+@pytest.mark.parametrize(
+    "path,sent",
+    [
+        (".github/workflows/ci.yml", ".github/workflows/ci.yml"),
+        (".github/workflows/ci.yml#.yml", ".github/workflows/ci.yml%23.yml"),
+        (".github/workflows/ci.yml?x=.yml", ".github/workflows/ci.yml%3Fx%3D.yml"),
+        (".github/workflows/%63i.yml", ".github/workflows/%2563i.yml"),
+    ],
+)
+def test_read_config_text_encodes_the_path(mocker, path, sent):
+    # A `#`, `?` or `%` in a file name must not turn the read into another
+    # file, or drop the `ref`.
+    run = mocker.patch.object(
+        github, "_run", return_value=_proc(stdout='{"content": "eA=="}')
+    )
+    assert github.read_config_text("o/r", "abc", path) == "x"
+    assert run.call_args.args[0][2] == f"repos/o/r/contents/{sent}"
