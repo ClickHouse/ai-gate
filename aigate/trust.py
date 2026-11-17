@@ -1,7 +1,8 @@
 """Load and validate the gate's trust policy, ``aigate/trust_policy.yaml``.
 
-The file holds the risk-tier rules (``aigate.tiers``) and the approver's
-always-human floor (``aigate_approver.guardrails``). It ships with the package
+The file holds the risk-tier rules (``aigate.tiers``), the approver's
+always-human floor (``aigate_approver.guardrails``) and what the approver may
+do on a fork pull request (``aigate_approver.cosign``). It ships with the package
 and is validated in full when first read: an unknown key, a wrong type or an
 out-of-range tier raises ``TrustPolicyError``, so a policy that silently does
 less than it says can never load. Every consumer imports it at start-up, so a
@@ -24,6 +25,11 @@ CODEOWNER_AUTHOR = "codeowner_author"
 MAINTAINER_AUTHOR = "maintainer_author"
 # The deterministic checks a floor rule may name in ``unless``.
 EXCEPTIONS = frozenset({CODEOWNER_AUTHOR, MAINTAINER_AUTHOR})
+# ``approver.forks.mode``: whether the approver may co-sign a fork pull request.
+FORKS_NEVER = "never"
+FORKS_COSIGN = "cosign"
+FORK_MODES = (FORKS_NEVER, FORKS_COSIGN)
+VISIBILITIES = ("public", "internal", "private")
 
 
 class TrustPolicyError(ValueError):
@@ -53,12 +59,29 @@ class FloorRule:
 
 
 @dataclass(frozen=True)
+class ForkPolicy:
+    """``approver.forks``: what the approver may do on a fork pull request."""
+
+    mode: str = FORKS_NEVER
+    # Repository visibilities (``public``, ``internal``, ``private``) where a
+    # co-sign may happen.
+    visibility: frozenset[str] = frozenset()
+    # Lower-cased logins that never count as a human co-signer.
+    machine_accounts: frozenset[str] = frozenset()
+
+    def cosigns(self, visibility: str | None) -> bool:
+        """Whether a fork pull request in a repository of ``visibility`` may be co-signed."""
+        return self.mode == FORKS_COSIGN and visibility in self.visibility
+
+
+@dataclass(frozen=True)
 class TrustPolicy:
     tier_rules: tuple[TierRule, ...]
     unknown_path_tier: int
     always_human: tuple[FloorRule, ...]
     blocking_risk: frozenset[str]
     maintainer_roles: frozenset[str]
+    forks: ForkPolicy = ForkPolicy()
 
 
 @cache
@@ -92,7 +115,7 @@ def parse_trust_policy(text: str) -> TrustPolicy:
     approver = _mapping(
         top.get("approver"),
         "approver",
-        {"always_human", "blocking_risk", "maintainer_roles"},
+        {"always_human", "blocking_risk", "maintainer_roles", "forks"},
     )
     floor = tuple(
         _floor_rule(entry, i)
@@ -111,6 +134,27 @@ def parse_trust_policy(text: str) -> TrustPolicy:
         always_human=floor,
         blocking_risk=frozenset(level.lower() for level in risk),
         maintainer_roles=_roles(approver.get("maintainer_roles")),
+        forks=_forks(approver.get("forks")),
+    )
+
+
+def _forks(value: object) -> ForkPolicy:
+    where = "approver.forks"
+    forks = _mapping(value, where, {"mode", "visibility", "machine_accounts"})
+    mode = forks["mode"]
+    if mode not in FORK_MODES:
+        raise TrustPolicyError(f"{where}.mode must be one of {', '.join(FORK_MODES)}")
+    visibility = {
+        v.lower() for v in _strings(forks["visibility"], f"{where}.visibility")
+    }
+    if not visibility or not visibility <= set(VISIBILITIES):
+        raise TrustPolicyError(
+            f"{where}.visibility must name at least one of {', '.join(VISIBILITIES)}"
+        )
+    accounts = _strings(forks["machine_accounts"], f"{where}.machine_accounts")
+    assert isinstance(mode, str)
+    return ForkPolicy(
+        mode, frozenset(visibility), frozenset(a.lower() for a in accounts)
     )
 
 

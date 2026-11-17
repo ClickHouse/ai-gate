@@ -8,11 +8,15 @@ Every key is optional:
         - paths: ["auth/**"]
           reviewers: "@org/security"
       security_dismissal_reviewers: "@org/security"
+    approver:                    # tightens the approver's central policy
+      forks: never               # never co-sign a fork pull request here
 
 With no file, the gate requires the default reviewer and applies no policy.
 The file is read from the base branch, and a malformed file fails closed. This
 module splits the document; ``reviewers.load_config`` and
-``policy.load_policy`` validate each section.
+``policy.load_policy`` validate each section, ``approver_fork_mode`` the
+``approver:`` one (read only by the approver; the gate validates it so a typo
+fails closed here too).
 """
 
 from __future__ import annotations
@@ -21,10 +25,12 @@ import yaml
 
 from .policy import GatePolicy, load_policy
 from .reviewers import ConfigError, load_config
+from .trust import FORK_MODES
 
 GATE_CONFIG_PATH = ".github/ai-gate.yml"
 
-_TOP_KEYS = frozenset({"reviewers", "policy"})
+_TOP_KEYS = frozenset({"reviewers", "policy", "approver"})
+_APPROVER_KEYS = frozenset({"forks"})
 
 
 def load_gate_config(text: str | None) -> tuple[list[str], GatePolicy | None]:
@@ -54,7 +60,7 @@ def load_gate_config(text: str | None) -> tuple[list[str], GatePolicy | None]:
     if unknown:
         raise ConfigError(
             f"{GATE_CONFIG_PATH}: unknown top-level key(s) "
-            f"{', '.join(map(repr, unknown))}. Known keys: 'reviewers', 'policy'. "
+            f"{', '.join(map(repr, unknown))}. Known keys: 'reviewers', 'policy', 'approver'. "
             f"(Policy keys like 'escalation_paths' go under 'policy:'.)"
         )
 
@@ -75,4 +81,42 @@ def load_gate_config(text: str | None) -> tuple[list[str], GatePolicy | None]:
     else:
         policy_text = None
 
+    _approver_section(doc)
     return load_config(reviewers_text), load_policy(policy_text)
+
+
+def approver_fork_mode(text: str | None) -> str | None:
+    """Return the repository's ``approver: forks:`` setting, or ``None``.
+
+    The repository can only tighten the central ``approver.forks.mode``
+    (``aigate.trust``); the approver takes the stricter of the two. Raises
+    ``ConfigError`` on a malformed file, like ``load_gate_config``.
+    """
+    if text is None:
+        return None
+    try:
+        doc = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"{GATE_CONFIG_PATH} is not valid YAML: {exc}") from exc
+    if not isinstance(doc, dict):
+        return None
+    section = _approver_section(doc)
+    return None if section is None else section.get("forks")
+
+
+def _approver_section(doc: dict) -> dict | None:
+    if "approver" not in doc:
+        return None
+    section = doc["approver"]
+    where = f"{GATE_CONFIG_PATH}: 'approver'"
+    if not isinstance(section, dict) or not section:
+        raise ConfigError(f"{where} must be a non-empty mapping.")
+    unknown = sorted(set(section) - _APPROVER_KEYS)
+    if unknown:
+        raise ConfigError(
+            f"{where}: unknown key(s) {', '.join(map(repr, unknown))}. "
+            f"Known keys: {', '.join(sorted(_APPROVER_KEYS))}."
+        )
+    if section.get("forks") not in FORK_MODES:
+        raise ConfigError(f"{where}.forks must be one of {', '.join(FORK_MODES)}.")
+    return section

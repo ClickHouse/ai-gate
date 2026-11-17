@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from aigate.gateconfig import load_gate_config
+from aigate.gateconfig import approver_fork_mode, load_gate_config
 from aigate.reviewers import ConfigError
 
 
@@ -58,3 +58,33 @@ def test_empty_file_fails_closed() -> None:
 def test_unknown_reviewer_fails_closed() -> None:
     with pytest.raises(ConfigError):
         load_gate_config("reviewers: [totallylegitbot]\n")
+
+
+@pytest.mark.parametrize("mode", ["never", "cosign"])
+def test_the_approver_section_is_read_for_the_approver_only(mode: str) -> None:
+    text = f"reviewers: [bugbot]\napprover:\n  forks: {mode}\n"
+    required, policy = load_gate_config(text)
+    assert required == ["bugbot"] and policy is None  # the gate is unchanged
+    assert approver_fork_mode(text) == mode
+
+
+def test_no_approver_section_is_no_setting() -> None:
+    assert approver_fork_mode(None) is None
+    assert approver_fork_mode("reviewers: [bugbot]\n") is None
+
+
+@pytest.mark.parametrize(
+    "section",
+    [
+        "approver:\n",
+        "approver: {}\n",
+        "approver: never\n",
+        "approver:\n  forks: always\n",
+        "approver:\n  forks: never\n  extra: 1\n",
+    ],
+)
+def test_a_malformed_approver_section_fails_closed(section: str) -> None:
+    with pytest.raises(ConfigError):
+        load_gate_config(section)
+    with pytest.raises(ConfigError):
+        approver_fork_mode(section)

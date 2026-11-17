@@ -51,6 +51,11 @@ Without a `policy:`, a clean AI review passes. With one, dismissed findings,
 escalation paths and [high-risk files](aigate/tiers.py) also need a human
 approval. See [`ai-gate.example.yml`](ai-gate.example.yml) for every key.
 
+An `approver:` block is read only by an auto-approver built on this package,
+and can only make it stricter: `forks: never` keeps fork pull requests for
+people even where the approver may co-sign a maintainer's approval of one
+(`approver.forks` in [`aigate/trust_policy.yaml`](aigate/trust_policy.yaml)).
+
 ## How it decides
 
 - Only the reviewer's own GitHub App check counts, never a check name alone.

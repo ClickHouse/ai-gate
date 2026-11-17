@@ -117,6 +117,25 @@ approver:
   # approver can check.
   maintainer_roles: [maintain, admin]
 
+  # Pull requests from a fork. The approver never approves one on its own. With
+  # `mode: cosign` it may add the second approval GitHub requires next to a
+  # human's: a person with write access (not the author, not a machine
+  # account) has a standing approval on the exact head, the AI review is green
+  # on that head, nothing on the floor above changed, and the base branch's
+  # live rules dismiss stale approvals and ask for at most one. That is the
+  # case of a maintainer who finished a contributor's pull request: their own
+  # approval does not count for their own push. `never` keeps every fork pull
+  # request for humans. `visibility` names the repositories it applies to:
+  # public ones are where outside contributors open fork pull requests. A
+  # repository can only tighten this (`approver: forks: never` in its
+  # .github/ai-gate.yml).
+  forks:
+    mode: cosign
+    visibility: [public]
+    # Accounts of type User that are machines (CI, release or sync users):
+    # they never count as the human co-signer. Logins, case-insensitive.
+    machine_accounts: []
+
   # A reviewer-declared risk in the pull request body at these levels blocks.
   # Advisory only (the body is author-editable): it can stop the honest case,
   # never be used to force an approval.

@@ -12,6 +12,7 @@ import yaml
 from aigate import tiers
 from aigate.trust import (
     CODEOWNER_AUTHOR,
+    FORKS_COSIGN,
     MAINTAINER_AUTHOR,
     POLICY_FILE,
     TrustPolicyError,
@@ -36,6 +37,14 @@ def test_the_packaged_policy_loads() -> None:
     assert policy.unknown_path_tier == 2
     assert policy.blocking_risk == {"high", "critical"}
     assert policy.maintainer_roles == {"maintain", "admin"}
+    # Co-signing fork pull requests is on for public repositories only.
+    assert policy.forks.mode == FORKS_COSIGN
+    assert policy.forks.visibility == {"public"}
+    assert policy.forks.machine_accounts == frozenset()
+    assert policy.forks.cosigns("public")
+    assert not policy.forks.cosigns("private")
+    assert not policy.forks.cosigns("internal")
+    assert not policy.forks.cosigns(None)
 
 
 def test_the_tier_map_is_the_policy_file() -> None:
@@ -115,6 +124,15 @@ def _with(path: list[object], value: object) -> dict[str, object]:
         (["approver", "blocking_risk"], ["severe"]),
         (["approver", "maintainer_roles"], ["write"]),
         (["approver", "maintainer_roles"], []),
+        (["approver", "forks"], "cosign"),
+        (["approver", "forks", "mode"], "always"),
+        (["approver", "forks", "mode"], True),
+        (["approver", "forks", "machine_accounts"], "ci-bot"),
+        (["approver", "forks", "machine_accounts"], [""]),
+        (["approver", "forks", "extra"], 1),
+        (["approver", "forks", "visibility"], []),
+        (["approver", "forks", "visibility"], ["secret"]),
+        (["approver", "forks", "visibility"], "public"),
     ],
 )
 def test_a_malformed_policy_is_refused(path: list[object], value: object) -> None:
@@ -128,6 +146,9 @@ def test_a_malformed_policy_is_refused(path: list[object], value: object) -> Non
         ["tiers"],
         ["approver"],
         ["tiers", "rules", 0, "why"],
+        ["approver", "forks"],
+        ["approver", "forks", "machine_accounts"],
+        ["approver", "forks", "visibility"],
     ],
 )
 def test_a_missing_section_is_refused(path: list[object]) -> None:
@@ -143,3 +164,13 @@ def test_a_missing_section_is_refused(path: list[object]) -> None:
 def test_not_yaml_is_refused() -> None:
     with pytest.raises(TrustPolicyError):
         parse_trust_policy("tiers: [")
+
+
+def test_machine_accounts_are_case_insensitive() -> None:
+    doc = _with(
+        ["approver", "forks"],
+        {"mode": "cosign", "visibility": ["public"], "machine_accounts": ["CI-Bot"]},
+    )
+    policy = parse_trust_policy(yaml.safe_dump(doc))
+    assert policy.forks.mode == "cosign"
+    assert policy.forks.machine_accounts == {"ci-bot"}
