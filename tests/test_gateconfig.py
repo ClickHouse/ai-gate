@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from aigate.gateconfig import approver_fork_mode, load_gate_config
+from aigate.gateconfig import approver_fork_mode, approver_risk_mode, load_gate_config
 from aigate.reviewers import ConfigError
 
 
@@ -71,6 +71,23 @@ def test_the_approver_section_is_read_for_the_approver_only(mode: str) -> None:
 def test_no_approver_section_is_no_setting() -> None:
     assert approver_fork_mode(None) is None
     assert approver_fork_mode("reviewers: [bugbot]\n") is None
+    assert approver_risk_mode(None) is None
+    assert approver_risk_mode("reviewers: [bugbot]\n") is None
+
+
+def test_risk_block_is_read_for_the_approver_only() -> None:
+    text = "reviewers: [bugbot]\napprover:\n  risk: block\n"
+    required, policy = load_gate_config(text)
+    assert required == ["bugbot"] and policy is None  # the gate is unchanged
+    assert approver_risk_mode(text) == "block"
+    assert approver_fork_mode(text) is None  # forks may be left out now
+
+
+def test_forks_and_risk_together() -> None:
+    text = "approver:\n  forks: never\n  risk: block\n"
+    load_gate_config(text)
+    assert approver_fork_mode(text) == "never"
+    assert approver_risk_mode(text) == "block"
 
 
 @pytest.mark.parametrize(
@@ -81,6 +98,9 @@ def test_no_approver_section_is_no_setting() -> None:
         "approver: never\n",
         "approver:\n  forks: always\n",
         "approver:\n  forks: never\n  extra: 1\n",
+        "approver:\n  risk: allow\n",
+        "approver:\n  risk: true\n",
+        "approver:\n  forks: never\n  risk: maybe\n",
     ],
 )
 def test_a_malformed_approver_section_fails_closed(section: str) -> None:
@@ -88,3 +108,5 @@ def test_a_malformed_approver_section_fails_closed(section: str) -> None:
         load_gate_config(section)
     with pytest.raises(ConfigError):
         approver_fork_mode(section)
+    with pytest.raises(ConfigError):
+        approver_risk_mode(section)

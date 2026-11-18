@@ -45,7 +45,10 @@
 # --- the approver -----------------------------------------------------------
 # Read only by the auto-approver, and only to tighten its central trust
 # policy. `forks: never` keeps fork pull requests for humans even where the
-# approver may co-sign a maintainer's approval of one.
+# approver may co-sign a maintainer's approval of one. `risk: block` keeps a
+# person on every pull request a reviewer rates High/Critical risk; without
+# it, a maintainer's or a code owner's own pull request is approved.
 #
 # approver:
 #   forks: never
+#   risk: block

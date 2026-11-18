@@ -36,6 +36,8 @@ def test_the_packaged_policy_loads() -> None:
     policy = load_trust_policy()
     assert policy.unknown_path_tier == 2
     assert policy.blocking_risk == {"high", "critical"}
+    # A maintainer's or code owner's own pull request clears a declared risk.
+    assert policy.blocking_risk_unless == {MAINTAINER_AUTHOR, CODEOWNER_AUTHOR}
     assert policy.maintainer_roles == {"maintain", "admin"}
     # Co-signing fork pull requests is on for public repositories only.
     assert policy.forks.mode == FORKS_COSIGN
@@ -122,6 +124,9 @@ def _with(path: list[object], value: object) -> dict[str, object]:
         (["approver", "always_human", 0, "unless"], "codeowner_author"),
         (["approver", "always_human", 0, "unless"], ["unprivileged_workflow"]),
         (["approver", "blocking_risk"], ["severe"]),
+        (["approver", "blocking_risk_unless"], ["anything_else"]),
+        (["approver", "blocking_risk_unless"], "maintainer_author"),
+        (["approver", "blocking_risk_unless"], [""]),
         (["approver", "maintainer_roles"], ["write"]),
         (["approver", "maintainer_roles"], []),
         (["approver", "forks"], "cosign"),
@@ -174,3 +179,17 @@ def test_machine_accounts_are_case_insensitive() -> None:
     policy = parse_trust_policy(yaml.safe_dump(doc))
     assert policy.forks.mode == "cosign"
     assert policy.forks.machine_accounts == {"ci-bot"}
+
+
+def test_blocking_risk_unless_must_be_stated() -> None:
+    # An empty list says "nothing clears a risk"; a missing key is an error.
+    doc = copy.deepcopy(_doc())
+    del doc["approver"]["blocking_risk_unless"]  # type: ignore[index, attr-defined]
+    with pytest.raises(TrustPolicyError):
+        _parse(doc)
+    assert (
+        parse_trust_policy(
+            yaml.safe_dump(_with(["approver", "blocking_risk_unless"], []))
+        ).blocking_risk_unless
+        == frozenset()
+    )

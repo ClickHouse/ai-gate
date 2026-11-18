@@ -140,3 +140,11 @@ approver:
   # Advisory only (the body is author-editable): it can stop the honest case,
   # never be used to force an approval.
   blocking_risk: [high, critical]
+  # ...unless one of these checks clears it: the author is a maintainer of the
+  # repository, or a code owner of every changed file in the base branch's
+  # CODEOWNERS. Their own pull request with a clean review is theirs to merge,
+  # however large: the risk callout
+  # rates the size of the change, not a finding (a finding fails the
+  # reviewer's check). A repository that wants a person on every declared
+  # High/Critical change sets `approver: risk: block` in its .github/ai-gate.yml.
+  blocking_risk_unless: [maintainer_author, codeowner_author]

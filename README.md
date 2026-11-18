@@ -54,7 +54,10 @@ approval. See [`ai-gate.example.yml`](ai-gate.example.yml) for every key.
 An `approver:` block is read only by an auto-approver built on this package,
 and can only make it stricter: `forks: never` keeps fork pull requests for
 people even where the approver may co-sign a maintainer's approval of one
-(`approver.forks` in [`aigate/trust_policy.yaml`](aigate/trust_policy.yaml)).
+(`approver.forks` in [`aigate/trust_policy.yaml`](aigate/trust_policy.yaml)),
+and `risk: block` keeps a person on every pull request a reviewer rates
+High/Critical risk, even a maintainer's or a code owner's own
+(`approver.blocking_risk_unless`).
 
 ## How it decides
 

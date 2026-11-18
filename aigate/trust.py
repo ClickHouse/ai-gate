@@ -29,6 +29,14 @@ EXCEPTIONS = frozenset({CODEOWNER_AUTHOR, MAINTAINER_AUTHOR})
 FORKS_NEVER = "never"
 FORKS_COSIGN = "cosign"
 FORK_MODES = (FORKS_NEVER, FORKS_COSIGN)
+# The checks ``approver.blocking_risk_unless`` may name. The declared risk is
+# about the whole pull request, so ``codeowner_author`` means an owner of
+# every changed file.
+RISK_EXCEPTIONS = frozenset({CODEOWNER_AUTHOR, MAINTAINER_AUTHOR})
+# ``approver: risk:`` in a repository's .github/ai-gate.yml: a declared risk
+# blocks whoever opened the pull request.
+RISK_BLOCK = "block"
+RISK_MODES = (RISK_BLOCK,)
 VISIBILITIES = ("public", "internal", "private")
 
 
@@ -82,6 +90,8 @@ class TrustPolicy:
     blocking_risk: frozenset[str]
     maintainer_roles: frozenset[str]
     forks: ForkPolicy = ForkPolicy()
+    # Checks (``RISK_EXCEPTIONS``) any one of which clears a blocking risk.
+    blocking_risk_unless: frozenset[str] = frozenset()
 
 
 @cache
@@ -115,7 +125,13 @@ def parse_trust_policy(text: str) -> TrustPolicy:
     approver = _mapping(
         top.get("approver"),
         "approver",
-        {"always_human", "blocking_risk", "maintainer_roles", "forks"},
+        {
+            "always_human",
+            "blocking_risk",
+            "blocking_risk_unless",
+            "maintainer_roles",
+            "forks",
+        },
     )
     floor = tuple(
         _floor_rule(entry, i)
@@ -127,6 +143,15 @@ def parse_trust_policy(text: str) -> TrustPolicy:
         raise TrustPolicyError(
             f"approver.blocking_risk: levels must be among {sorted(allowed_risk)}"
         )
+    risk_unless = frozenset(
+        _strings(approver.get("blocking_risk_unless"), "approver.blocking_risk_unless")
+    )
+    unknown_checks = sorted(risk_unless - RISK_EXCEPTIONS)
+    if unknown_checks:
+        raise TrustPolicyError(
+            f"approver.blocking_risk_unless: unknown check(s) {', '.join(unknown_checks)}; "
+            f"known: {', '.join(sorted(RISK_EXCEPTIONS))}"
+        )
 
     return TrustPolicy(
         tier_rules=tier_rules,
@@ -135,6 +160,7 @@ def parse_trust_policy(text: str) -> TrustPolicy:
         blocking_risk=frozenset(level.lower() for level in risk),
         maintainer_roles=_roles(approver.get("maintainer_roles")),
         forks=_forks(approver.get("forks")),
+        blocking_risk_unless=risk_unless,
     )
 
 

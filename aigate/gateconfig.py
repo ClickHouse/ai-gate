@@ -10,12 +10,14 @@ Every key is optional:
       security_dismissal_reviewers: "@org/security"
     approver:                    # tightens the approver's central policy
       forks: never               # never co-sign a fork pull request here
+      risk: block                # a declared High/Critical risk needs a person,
+                                 # even on a maintainer's pull request
 
 With no file, the gate requires the default reviewer and applies no policy.
 The file is read from the base branch, and a malformed file fails closed. This
 module splits the document; ``reviewers.load_config`` and
-``policy.load_policy`` validate each section, ``approver_fork_mode`` the
-``approver:`` one (read only by the approver; the gate validates it so a typo
+``policy.load_policy`` validate each section, ``approver_fork_mode`` and
+``approver_risk_mode`` the ``approver:`` one (read only by the approver; the gate validates it so a typo
 fails closed here too).
 """
 
@@ -25,12 +27,12 @@ import yaml
 
 from .policy import GatePolicy, load_policy
 from .reviewers import ConfigError, load_config
-from .trust import FORK_MODES
+from .trust import FORK_MODES, RISK_MODES
 
 GATE_CONFIG_PATH = ".github/ai-gate.yml"
 
 _TOP_KEYS = frozenset({"reviewers", "policy", "approver"})
-_APPROVER_KEYS = frozenset({"forks"})
+_APPROVER_KEYS = frozenset({"forks", "risk"})
 
 
 def load_gate_config(text: str | None) -> tuple[list[str], GatePolicy | None]:
@@ -104,6 +106,26 @@ def approver_fork_mode(text: str | None) -> str | None:
     return None if section is None else section.get("forks")
 
 
+def approver_risk_mode(text: str | None) -> str | None:
+    """Return the repository's ``approver: risk:`` setting, or ``None``.
+
+    ``block`` takes away the central ``approver.blocking_risk_unless`` checks
+    (``aigate.trust``) here: a declared High/Critical risk then needs a person
+    whoever opened the pull request. Raises ``ConfigError`` on a malformed
+    file, like ``load_gate_config``.
+    """
+    if text is None:
+        return None
+    try:
+        doc = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"{GATE_CONFIG_PATH} is not valid YAML: {exc}") from exc
+    if not isinstance(doc, dict):
+        return None
+    section = _approver_section(doc)
+    return None if section is None else section.get("risk")
+
+
 def _approver_section(doc: dict) -> dict | None:
     if "approver" not in doc:
         return None
@@ -117,6 +139,8 @@ def _approver_section(doc: dict) -> dict | None:
             f"{where}: unknown key(s) {', '.join(map(repr, unknown))}. "
             f"Known keys: {', '.join(sorted(_APPROVER_KEYS))}."
         )
-    if section.get("forks") not in FORK_MODES:
+    if "forks" in section and section["forks"] not in FORK_MODES:
         raise ConfigError(f"{where}.forks must be one of {', '.join(FORK_MODES)}.")
+    if "risk" in section and section["risk"] not in RISK_MODES:
+        raise ConfigError(f"{where}.risk must be one of {', '.join(RISK_MODES)}.")
     return section
