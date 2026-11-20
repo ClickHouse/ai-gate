@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import re
 from pathlib import Path
 
@@ -823,6 +824,9 @@ def test_red_gate_links_the_rerun_button(mocker, monkeypatch):
     mocker.patch.object(github, "signals_for", return_value=_bugbot("neutral"))
     monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
     monkeypatch.setenv("GITHUB_RUN_ID", "42")
+    # Explicit: a runner (or a test run) may carry another server.
+    monkeypatch.setenv("GITHUB_SERVER_URL", "https://github.com")
+    monkeypatch.delenv("AIGATE_RERUN_INSTRUCTION", raising=False)
     assert cli.main(["gate"]) == 1
     assert "[Re-run the gate](https://github.com/o/r/actions/runs/42)" in (
         _gate_comment()
@@ -1040,6 +1044,371 @@ def test_post_check_run_false_skips_the_check_but_not_the_verdict(mocker, monkey
     monkeypatch.setenv("AIGATE_POST_CHECK_RUN", "true")
     assert cli.main(["gate"]) == 1
     post.assert_called_once()
+
+
+def _result(capsys) -> dict:
+    lines = [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("{") and cli.RESULT_EVENT in line
+    ]
+    assert len(lines) == 1, lines
+    return json.loads(lines[0])
+
+
+def test_the_result_line_is_off_unless_asked_for(mocker, capsys):
+    _patch_event(mocker)
+    mocker.patch.object(github, "read_config_text", return_value=None)
+    mocker.patch.object(github, "signals_for", return_value=[])
+    cli.main(["gate"])
+    assert cli.RESULT_EVENT not in capsys.readouterr().out
+
+
+def test_the_result_line_names_the_posted_check_run(mocker, monkeypatch, capsys):
+    post = _patch_event(mocker)
+    post.return_value = 4242
+    mocker.patch.object(github, "read_config_text", return_value=None)
+    mocker.patch.object(
+        github,
+        "signals_for",
+        return_value=[
+            Signal(app_slug=BUGBOT, name="Cursor Bugbot", conclusion=SUCCESS)
+        ],
+    )
+    mocker.patch.object(github, "last_base_change", return_value=None)
+    mocker.patch.object(github, "other_pulls_containing", return_value=[])
+    monkeypatch.setenv("AIGATE_RESULT_JSON", "true")
+    assert cli.main(["gate"]) == 0
+    result = _result(capsys)
+    assert result["outcome"] == SUCCESS and result["posted"] is True
+    assert result["check_run_id"] == 4242 and result["head_sha"] == "abc"
+    assert result["pushed_past"] is False and result["transient"] is False
+
+
+def test_a_failed_post_is_reported_as_not_posted(mocker, monkeypatch, capsys):
+    post = _patch_event(mocker)
+    post.side_effect = github.GitHubError("HTTP 403")
+    mocker.patch.object(github, "read_config_text", return_value=None)
+    mocker.patch.object(github, "signals_for", return_value=[])
+    monkeypatch.setenv("AIGATE_RESULT_JSON", "true")
+    assert cli.main(["gate"]) == 1
+    result = _result(capsys)
+    assert result["posted"] is False and result["check_run_id"] is None
+
+
+def test_an_unreadable_config_is_transient_in_the_result(mocker, monkeypatch, capsys):
+    _patch_event(mocker).return_value = 7
+    mocker.patch.object(
+        github, "read_config_text", side_effect=github.GitHubError("HTTP 502")
+    )
+    monkeypatch.setenv("AIGATE_RESULT_JSON", "true")
+    cli.main(["gate"])
+    result = _result(capsys)
+    assert result["outcome"] == "failure" and result["transient"] is True
+    assert result["title"] == cli.COULD_NOT_DECIDE_TITLE
+
+
+def test_not_indexed_yet_is_flagged(mocker, monkeypatch, capsys):
+    _patch_event(mocker).return_value = 7
+    mocker.patch.object(github, "read_config_text", return_value=None)
+    mocker.patch.object(
+        github,
+        "signals_for",
+        return_value=[
+            Signal(app_slug=BUGBOT, name="Cursor Bugbot", conclusion=SUCCESS)
+        ],
+    )
+    mocker.patch.object(github, "last_base_change", return_value=None)
+    mocker.patch.object(
+        github,
+        "other_pulls_containing",
+        side_effect=github.NotIndexedYetError("not listed yet"),
+    )
+    monkeypatch.setenv("AIGATE_RESULT_JSON", "true")
+    cli.main(["gate"])
+    result = _result(capsys)
+    assert result["outcome"] == "pending" and result["not_indexed"] is True
+
+
+def test_a_moved_head_is_reported_and_nothing_posted(mocker, monkeypatch, capsys):
+    post = _patch_event(mocker)
+    mocker.patch.object(github, "read_config_text", return_value=None)
+    mocker.patch.object(github, "signals_for", return_value=[])
+    mocker.patch.object(
+        github, "pull_detail", return_value={"head": {"sha": "newer"}, "draft": False}
+    )
+    monkeypatch.setenv("AIGATE_RESULT_JSON", "true")
+    assert cli.main(["gate"]) == 1
+    post.assert_not_called()
+    result = _result(capsys)
+    assert result["pushed_past"] is True and result["posted"] is False
+
+
+def test_the_comment_can_be_switched_off(mocker, monkeypatch):
+    _patch_event(mocker)
+    mocker.patch.object(github, "read_config_text", return_value=None)
+    mocker.patch.object(github, "signals_for", return_value=[])
+    monkeypatch.setenv("AIGATE_POST_COMMENT", "false")
+    cli.main(["gate"])
+    github.list_issue_comments.assert_not_called()
+    github.create_issue_comment.assert_not_called()
+
+
+ACTIONS_ENV = {
+    "GITHUB_ACTIONS": "true",
+    "GITHUB_RUN_ID": "1",
+    "GITHUB_SERVER_URL": "https://github.example",
+    "GITHUB_REPOSITORY": "o/r",
+}
+
+
+@pytest.mark.parametrize("in_actions", [False, True], ids=["plain", "actions-env"])
+def test_the_rerun_instruction_can_be_replaced(mocker, monkeypatch, in_actions):
+    # Both ways, explicitly: CI sets the Actions variables, a laptop does not.
+    for name, value in ACTIONS_ENV.items():
+        if in_actions:
+            monkeypatch.setenv(name, value)
+        else:
+            monkeypatch.delenv(name, raising=False)
+    post = _patch_event(mocker)
+    mocker.patch.object(
+        github, "read_config_text", side_effect=github.GitHubError("HTTP 502")
+    )
+    cli.main(["gate"])
+    default = post.call_args.args[6]
+    assert "Re-run the gate; if it keeps failing" in default
+    # The workflow run's own re-run link appears only inside Actions.
+    assert ("actions/runs/1" in default) is in_actions
+    monkeypatch.setenv("AIGATE_RERUN_INSTRUCTION", "comment `/ai-gate check`")
+    cli.main(["gate"])
+    summary = post.call_args.args[6]
+    assert "Comment `/ai-gate check`; if it keeps failing" in summary
+    # Not a workflow run: no run link and no "Re-run jobs" text, whatever the
+    # environment says.
+    assert "re-run" not in summary.lower() and "actions/runs" not in summary
+
+
+def _identity_mocks(mocker, states):
+    """pull_detail answers ``states`` in turn (the start, then before the post)."""
+
+    def detail(slug, number):
+        state = states.pop(0) if len(states) > 1 else states[0]
+        return {
+            "state": state.get("state", "open"),
+            "draft": False,
+            "head": {"sha": state.get("head", "abc")},
+            "base": {
+                "ref": state.get("base", "main"),
+                "repo": {"default_branch": state.get("default", "main")},
+            },
+        }
+
+    mocker.patch.object(github, "pull_detail", side_effect=detail)
+
+
+@pytest.mark.parametrize(
+    "later,why",
+    [
+        ({"base": "side"}, "base main -> side"),
+        ({"state": "closed"}, "state closed"),
+    ],
+)
+def test_a_retarget_before_the_post_posts_nothing(
+    mocker, monkeypatch, capsys, later, why
+):
+    post = _green_gate(mocker)
+    _identity_mocks(mocker, [{}, {}, later])
+    monkeypatch.setenv("AIGATE_RECHECK_BEFORE_POST", "true")
+    monkeypatch.setenv("AIGATE_RESULT_JSON", "true")
+    assert cli.main(["gate"]) == 1
+    post.assert_not_called()
+    result = _result(capsys)
+    assert result["posted"] is False and result["stale"] == why
+
+
+def test_a_retarget_away_and_back_posts_nothing(mocker, monkeypatch, capsys):
+    post = _green_gate(mocker)
+    _identity_mocks(mocker, [{}])
+    mocker.patch.object(
+        github,
+        "last_base_change",
+        side_effect=[None, None, "2026-11-20T10:00:00Z"],
+    )
+    monkeypatch.setenv("AIGATE_RECHECK_BEFORE_POST", "true")
+    monkeypatch.setenv("AIGATE_RESULT_JSON", "true")
+    cli.main(["gate"])
+    post.assert_not_called()
+    assert _result(capsys)["stale"] == "retargeted"
+
+
+def test_default_branch_only(mocker, monkeypatch, capsys):
+    post = _green_gate(mocker)
+    _identity_mocks(mocker, [{"base": "side", "default": "main"}])
+    monkeypatch.setenv("AIGATE_RECHECK_BEFORE_POST", "true")
+    monkeypatch.setenv("AIGATE_DEFAULT_BRANCH_ONLY", "true")
+    monkeypatch.setenv("AIGATE_RESULT_JSON", "true")
+    # The event says main; the live PR is into side from the start.
+    cli.main(["gate"])
+    post.assert_not_called()
+
+
+def test_an_unchanged_pull_request_posts(mocker, monkeypatch, capsys):
+    post = _green_gate(mocker)
+    _identity_mocks(mocker, [{}])
+    monkeypatch.setenv("AIGATE_RECHECK_BEFORE_POST", "true")
+    monkeypatch.setenv("AIGATE_DEFAULT_BRANCH_ONLY", "true")
+    monkeypatch.setenv("AIGATE_RESULT_JSON", "true")
+    assert cli.main(["gate"]) == 0
+    post.assert_called_once()
+    assert _result(capsys)["stale"] is None
+
+
+def test_without_the_switch_nothing_is_re_read(mocker, monkeypatch):
+    _green_gate(mocker)
+    monkeypatch.delenv("AIGATE_RECHECK_BEFORE_POST", raising=False)
+    calls = []
+    mocker.patch.object(
+        github,
+        "last_base_change",
+        side_effect=lambda *a: calls.append(a) or None,
+    )
+    cli.main(["gate"])
+    assert len(calls) == 1  # only the evaluation's own read
+
+
+def _green_gate(mocker):
+    post = _patch_event(mocker)
+    post.return_value = 4242
+    mocker.patch.object(github, "read_config_text", return_value=None)
+    mocker.patch.object(
+        github,
+        "signals_for",
+        return_value=[
+            Signal(app_slug=BUGBOT, name="Cursor Bugbot", conclusion=SUCCESS)
+        ],
+    )
+    mocker.patch.object(github, "last_base_change", return_value=None)
+    mocker.patch.object(github, "other_pulls_containing", return_value=[])
+    return post
+
+
+def test_an_unchanged_verdict_reuses_the_known_run(mocker, monkeypatch, capsys):
+    post = _green_gate(mocker)
+    monkeypatch.setenv("AIGATE_RESULT_JSON", "true")
+    assert cli.main(["gate"]) == 0
+    first = _result(capsys)
+    known = {
+        "id": 77,
+        "head_sha": "abc",
+        "status": "completed",
+        "conclusion": "success",
+        "title": first["title"],
+        "summary": first["summary"],
+    }
+    monkeypatch.setenv("AIGATE_UNCHANGED_CHECK_RUN", json.dumps(known))
+    post.reset_mock()
+    assert cli.main(["gate"]) == 0
+    post.assert_not_called()
+    result = _result(capsys)
+    assert result["check_run_id"] == 77 and result["reused"] is True
+    assert result["posted"] is True
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"conclusion": "failure"},
+        {"title": "other"},
+        {"summary": "other"},
+        {"head_sha": "def"},
+        {"status": "in_progress"},
+        {"id": "77"},
+    ],
+)
+def test_any_difference_posts_a_new_run(mocker, monkeypatch, capsys, change):
+    post = _green_gate(mocker)
+    monkeypatch.setenv("AIGATE_RESULT_JSON", "true")
+    cli.main(["gate"])
+    first = _result(capsys)
+    known = {
+        "id": 77,
+        "head_sha": "abc",
+        "status": "completed",
+        "conclusion": "success",
+        "title": first["title"],
+        "summary": first["summary"],
+        **change,
+    }
+    monkeypatch.setenv("AIGATE_UNCHANGED_CHECK_RUN", json.dumps(known))
+    post.reset_mock()
+    cli.main(["gate"])
+    post.assert_called_once()
+    result = _result(capsys)
+    assert result["check_run_id"] == 4242 and result["reused"] is False
+
+
+def test_a_malformed_known_run_posts(mocker, monkeypatch, capsys):
+    post = _green_gate(mocker)
+    monkeypatch.setenv("AIGATE_UNCHANGED_CHECK_RUN", "{not json")
+    cli.main(["gate"])
+    post.assert_called_once()
+
+
+def test_a_config_file_replaces_the_repositorys_entirely(tmp_path, monkeypatch, mocker):
+    run = mocker.patch.object(github.subprocess, "run")
+    path = tmp_path / "gate.yml"
+    path.write_text("reviewers:\n  - bugbot\n")
+    monkeypatch.setenv("AIGATE_CONFIG_FILE", str(path))
+    assert github.read_config_text("o/r", "main", ".github/ai-gate.yml") == (
+        "reviewers:\n  - bugbot\n"
+    )
+    run.assert_not_called()  # the repository's file is never fetched
+    # Any other file is read from the repository as always.
+    run.return_value = mocker.Mock(returncode=1, stdout="", stderr="HTTP 404")
+    assert github.read_config_text("o/r", "main", ".github/CODEOWNERS") is None
+    run.assert_called_once()
+
+
+def test_an_unreadable_config_file_never_falls_back(tmp_path, monkeypatch):
+    monkeypatch.setenv("AIGATE_CONFIG_FILE", str(tmp_path / "missing.yml"))
+    with pytest.raises(github.GitHubError, match="unreadable"):
+        github.read_config_text("o/r", "main", ".github/ai-gate.yml")
+
+
+def test_without_it_the_repository_file_is_read(mocker, monkeypatch):
+    monkeypatch.delenv("AIGATE_CONFIG_FILE", raising=False)
+    run = mocker.patch.object(
+        github.subprocess,
+        "run",
+        return_value=mocker.Mock(returncode=1, stdout="", stderr="HTTP 404"),
+    )
+    assert github.read_config_text("o/r", "main", ".github/ai-gate.yml") is None
+    run.assert_called_once()
+
+
+def test_a_summary_note_ends_the_summary(mocker, monkeypatch):
+    post = _green_gate(mocker)
+    monkeypatch.setenv("AIGATE_SUMMARY_NOTE", "Configuration: provided centrally.")
+    cli.main(["gate"])
+    assert post.call_args.args[6].endswith("\n\nConfiguration: provided centrally.")
+
+
+def test_post_check_run_returns_the_new_runs_id(mocker):
+    proc = mocker.Mock(returncode=0, stdout='{"id": 99, "name": "ai-review-gate"}')
+    mocker.patch.object(github.subprocess, "run", return_value=proc)
+    assert (
+        github.post_check_run(
+            "o/r", "abc", "ai-review-gate", "completed", "success", "t", "s"
+        )
+        == 99
+    )
+    proc.stdout = ""
+    assert (
+        github.post_check_run(
+            "o/r", "abc", "ai-review-gate", "completed", "success", "t", "s"
+        )
+        is None
+    )
 
 
 def _required_workflow_path() -> tuple[Path, str]:

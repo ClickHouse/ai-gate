@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import json
 import os
 import sys
 import time
@@ -81,21 +82,37 @@ def _step_summary(text: str) -> None:
             pass
 
 
-# Next step when a GitHub read failed: not the author's fault, usually transient.
-_TRANSIENT_STEP = (
-    "This is a GitHub API or permissions problem, not your change. Re-run the "
-    "gate; if it keeps failing, ask a repository administrator."
-)
+# How the verdict text tells someone to get a fresh evaluation. The default
+# suits the gate run as a workflow; a caller that evaluates the gate some other
+# way (``AIGATE_RERUN_INSTRUCTION``, e.g. "comment `/ai-gate check`") says
+# its own thing instead.
+_DEFAULT_RERUN = "re-run the gate"
 
 
-def _failed(
-    msg: str, step: str = _TRANSIENT_STEP, *, rerun_helps: bool = True
-) -> Decision:
+def _rerun(default: str = _DEFAULT_RERUN, *, capital: bool = False) -> str:
+    text = os.environ.get("AIGATE_RERUN_INSTRUCTION", "").strip() or default
+    return text[:1].upper() + text[1:] if capital else text
+
+
+def _transient_step() -> str:
+    """Next step when a GitHub read failed: not the author's fault, usually transient."""
+    return (
+        f"This is a GitHub API or permissions problem, not your change. "
+        f"{_rerun(capital=True)}; if it keeps failing, ask a repository "
+        f"administrator."
+    )
+
+
+# The title of every verdict the gate could not reach (``_failed``).
+COULD_NOT_DECIDE_TITLE = "AI review gate could not decide"
+
+
+def _failed(msg: str, step: str | None = None, *, rerun_helps: bool = True) -> Decision:
     return Decision(
         outcome=FAILURE,
-        title="AI review gate could not decide",
-        summary=f"- ai-gate: {msg}\n\n**What to do:**\n- {step}",
-        transient=step is _TRANSIENT_STEP,
+        title=COULD_NOT_DECIDE_TITLE,
+        summary=f"- ai-gate: {msg}\n\n**What to do:**\n- {step or _transient_step()}",
+        transient=step is None,
         rerun_helps=rerun_helps,
     )
 
@@ -159,7 +176,7 @@ def _with_human_fallback(
             summary=(
                 f"{decision.summary}\n- Finding wrong, or reviewer stuck? Ask a "
                 f"human with write access who is not the PR author to approve "
-                f"this exact commit, then re-run the gate. Their approval stands "
+                f"this exact commit, then {_rerun()}. Their approval stands "
                 f"in for the AI review (a new push needs a new approval)."
             ),
         )
@@ -281,8 +298,9 @@ def _tied_to_this_pull(
             title="Checking the AI review belongs to this pull request",
             summary=(
                 f"- {exc}. GitHub indexes new commits within a few minutes.\n\n"
-                f"**What to do:**\n- Nothing yet. If this persists, re-run the gate."
+                f"**What to do:**\n- Nothing yet. If this persists, {_rerun()}."
             ),
+            not_indexed=True,
         )
     if not others:
         return decision
@@ -297,7 +315,7 @@ def _tied_to_this_pull(
             f"- Close the other pull request if it is not needed, then push a "
             f"new commit here so the reviewer reviews this pull request.\n"
             f"- Or ask someone with write access (not the author) to approve "
-            f"this commit, then re-run the gate."
+            f"this commit, then {_rerun()}."
         ),
         # A human approval can still arrive while the gate waits.
         retryable=True,
@@ -347,7 +365,7 @@ def evaluate(
             f"configuration error — {exc}",
             f"Fix `{GATE_CONFIG_PATH}` on `{pull.base_ref}` in its own pull request "
             f"(the gate reads it from the base branch, so fixing it here does "
-            f"nothing), then re-run this gate.",
+            f"nothing), then {_rerun('re-run this gate')}.",
         )
     except github.GitHubError as exc:
         return _failed(f"could not read the gate configuration — {exc}")
@@ -499,6 +517,55 @@ def _live_pull(slug: str, number: int) -> dict:
         return {}
 
 
+def _pull_identity(slug: str, pull: github.PullRef) -> dict | None:
+    """What the verdict is for: state, base, last retarget, head, default branch.
+
+    ``None`` when it cannot be read (then nothing is posted).
+    """
+    try:
+        live = github.pull_detail(slug, pull.number)
+        retargeted = github.last_base_change(slug, pull.number)
+    except github.GitHubError:
+        return None
+    if not isinstance(live, dict):
+        return None
+    base = live.get("base") or {}
+    return {
+        "state": live.get("state"),
+        "base": base.get("ref"),
+        "retargeted_at": retargeted,
+        "head": (live.get("head") or {}).get("sha"),
+        "default_branch": (base.get("repo") or {}).get("default_branch"),
+    }
+
+
+def _still_the_same(slug: str, pull: github.PullRef, before: dict | None) -> str | None:
+    """``None`` when the pull request is still the one the verdict was reached for.
+
+    Otherwise what changed. Compared right before posting: open, the same
+    base as the event and as at the start, no retarget in between (the
+    timeline's last base change, so away-and-back counts), the same head,
+    and with ``AIGATE_DEFAULT_BRANCH_ONLY`` a base that is the default branch.
+    Unreadable now or at the start: changed.
+    """
+    now = _pull_identity(slug, pull)
+    if before is None or now is None:
+        return "unreadable"
+    if now["state"] != "open":
+        return f"state {now['state']}"
+    if now["base"] != pull.base_ref or now["base"] != before["base"]:
+        return f"base {before['base']} -> {now['base']}"
+    if now["retargeted_at"] != before["retargeted_at"]:
+        return "retargeted"
+    if now["head"] != pull.head_sha or now["head"] != before["head"]:
+        return "head moved"
+    if _env_flag("AIGATE_DEFAULT_BRANCH_ONLY", default=False) and (
+        not now["default_branch"] or now["base"] != now["default_branch"]
+    ):
+        return f"base {now['base']} is not the default branch"
+    return None
+
+
 def _pushed_past(slug: str, pull: github.PullRef) -> bool:
     """Return True only when the live head is readable and is not ours."""
     live = (_live_pull(slug, pull.number).get("head") or {}).get("sha")
@@ -512,6 +579,10 @@ def cmd_gate(args: argparse.Namespace) -> int:
         return _gate_shadow(slug, event, args.reviewer_login)
 
     pull = github.resolve_pull(event, slug)
+    # With AIGATE_RECHECK_BEFORE_POST the pull request's identity is taken now
+    # and must still hold right before the verdict is posted (``_still_the_same``).
+    recheck = _env_flag("AIGATE_RECHECK_BEFORE_POST", default=False)
+    before = _pull_identity(slug, pull) if recheck else None
     decision = _evaluate_head(slug, pull, args.reviewer_login)
 
     # A ruleset-required workflow is not re-triggered when the reviewer finishes,
@@ -540,28 +611,101 @@ def cmd_gate(args: argparse.Namespace) -> int:
             f"the newer push has its own gate run. Nothing posted.",
             file=sys.stderr,
         )
+        _result_line(pull, decision, check_run_id=None, pushed_past=True)
         return 1
 
     if not decision.ok and decision.rerun_helps:
         decision = _with_rerun_hint(decision, wait_seconds)
+    note = os.environ.get("AIGATE_SUMMARY_NOTE", "").strip()
+    if note:
+        # A caller's one line about how this verdict was reached (for example
+        # where its configuration came from), at the end of the summary.
+        decision = dataclasses.replace(
+            decision, summary=f"{decision.summary}\n\n{note}"
+        )
 
     stream = sys.stdout if decision.ok else sys.stderr
     print(f"ai-gate: {decision.title}", file=stream)
     print(decision.summary, file=stream)
     _step_summary(f"### AI review gate — {decision.title}\n\n{decision.summary}")
-    _post_gate_check(
+    if recheck:
+        changed = _still_the_same(slug, pull, before)
+        if changed is not None:
+            # The verdict was reached for a pull request that is not this one
+            # any more (retargeted, closed, a new base): never posted.
+            print(
+                f"ai-gate: #{pull.number} changed during the evaluation ({changed}); "
+                f"nothing posted.",
+                file=sys.stderr,
+            )
+            _result_line(
+                pull, decision, check_run_id=None, pushed_past=False, stale=changed
+            )
+            return 1
+    check_run_id, reused = _publish_gate_check(
         slug, pull.head_sha, decision.outcome, decision.title, decision.summary
     )
-    _post_gate_comment(
-        slug,
-        pull.number,
-        pull.head_sha,
-        decision.outcome,
-        decision.title,
-        decision.summary,
-        decision.via_human_fallback,
+    if _env_flag("AIGATE_POST_COMMENT", default=True):
+        _post_gate_comment(
+            slug,
+            pull.number,
+            pull.head_sha,
+            decision.outcome,
+            decision.title,
+            decision.summary,
+            decision.via_human_fallback,
+        )
+    _result_line(
+        pull, decision, check_run_id=check_run_id, pushed_past=False, reused=reused
     )
     return 0 if decision.ok else 1
+
+
+def _env_flag(name: str, *, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw not in ("false", "0", "no")
+
+
+# The one machine-readable line ``gate`` prints when ``AIGATE_RESULT_JSON`` is
+# true, for a caller that runs the gate as a program rather than reading the
+# job status: what it decided, and whether and as which check run it published
+# that. The human-readable output is unchanged either way.
+RESULT_EVENT = "ai-gate-result"
+
+
+def _result_line(
+    pull: github.PullRef,
+    decision: Decision,
+    *,
+    check_run_id: int | None,
+    pushed_past: bool,
+    reused: bool = False,
+    stale: str | None = None,
+) -> None:
+    if not _env_flag("AIGATE_RESULT_JSON", default=False):
+        return
+    print(
+        json.dumps(
+            {
+                "event": RESULT_EVENT,
+                "pr": pull.number,
+                "head_sha": pull.head_sha,
+                "outcome": decision.outcome,
+                "posted": check_run_id is not None,
+                "check_run_id": check_run_id,
+                "reused": reused,
+                "stale": stale,
+                "pushed_past": pushed_past,
+                "transient": decision.transient,
+                "not_indexed": decision.not_indexed,
+                "title": decision.title,
+                "summary": decision.summary,
+            },
+            sort_keys=True,
+        )
+    )
 
 
 def _reviewer_has_posted(slug: str, pull: github.PullRef) -> bool:
@@ -607,8 +751,12 @@ def _with_rerun_hint(decision: Decision, wait_seconds: int) -> Decision:
     """Say the run has stopped, and link the button that re-runs it.
 
     A ruleset-required gate re-runs only on a push, not on an approval or a late
-    review, so the re-run should be one click away.
+    review, so the re-run should be one click away. A caller that replaced the
+    re-run instruction (``AIGATE_RERUN_INSTRUCTION``) is not a workflow run, so
+    nothing here applies to it, whatever the environment says.
     """
+    if os.environ.get("AIGATE_RERUN_INSTRUCTION", "").strip():
+        return decision
     notes = []
     if decision.outcome == PENDING and wait_seconds > 0:
         notes.append(
@@ -758,22 +906,74 @@ def _enforce(
     )
 
 
+def _unchanged_run(
+    head_sha: str, outcome: Outcome, title: str, summary: str
+) -> int | None:
+    """The id of a check run that already shows exactly this verdict, if any.
+
+    ``AIGATE_UNCHANGED_CHECK_RUN`` is a JSON object a caller may pass: the
+    newest ``ai-review-gate`` run it knows of on this head, as ``id``,
+    ``head_sha``, ``status``, ``conclusion``, ``title`` and ``summary``. When
+    this evaluation would post the same verdict (same head, state, title and
+    summary), posting again only adds a run, and a head keeps a bounded number
+    of them; that run is reported instead. Anything malformed means "post".
+    """
+    raw = os.environ.get("AIGATE_UNCHANGED_CHECK_RUN", "").strip()
+    if not raw:
+        return None
+    try:
+        known = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(known, dict):
+        return None
+    run_id = known.get("id")
+    if not isinstance(run_id, int) or isinstance(run_id, bool):
+        return None
+    status, conclusion = _CHECK_STATE[outcome]
+    same = (
+        known.get("head_sha") == head_sha
+        and known.get("status") == status
+        and known.get("conclusion") == conclusion
+        and known.get("title") == title
+        and known.get("summary") == summary[:60000]
+    )
+    return run_id if same else None
+
+
+def _publish_gate_check(
+    slug: str, head_sha: str, outcome: Outcome, title: str, summary: str
+) -> tuple[int | None, bool]:
+    """Post the verdict, or reuse an identical run; ``(run id, reused)``."""
+    if os.environ.get("AIGATE_POST_CHECK_RUN", "").strip().lower() != "false":
+        unchanged = _unchanged_run(head_sha, outcome, title, summary)
+        if unchanged is not None:
+            print(
+                f"ai-gate: the {CHECK_RUN_NAME} check-run {unchanged} already shows "
+                f"this verdict; nothing posted.",
+                file=sys.stderr,
+            )
+            return unchanged, True
+    return _post_gate_check(slug, head_sha, outcome, title, summary), False
+
+
 def _post_gate_check(
     slug: str, head_sha: str, outcome: Outcome, title: str, summary: str
-) -> None:
+) -> int | None:
     """Post the gate's verdict as a check-run on the head commit (best effort).
 
-    A ``GitHubError`` is logged, not raised; the exit code still reflects the
+    Returns the new check run's id, or ``None`` when nothing was posted. A
+    ``GitHubError`` is logged, not raised; the exit code still reflects the
     decision. ``AIGATE_POST_CHECK_RUN=false`` (the action's ``post-check-run``
     input) skips it: the org-required workflow has no ``checks: write``, its
     job status is the gate, and the post only produced a misleading "could not
     post … 403" line on every run.
     """
     if os.environ.get("AIGATE_POST_CHECK_RUN", "").strip().lower() == "false":
-        return
+        return None
     status, conclusion = _CHECK_STATE[outcome]
     try:
-        github.post_check_run(
+        run_id = github.post_check_run(
             slug, head_sha, CHECK_RUN_NAME, status, conclusion, title, summary
         )
     except github.GitHubError as exc:
@@ -781,6 +981,8 @@ def _post_gate_check(
             f"ai-gate: could not post the {CHECK_RUN_NAME} check-run — {exc}",
             file=sys.stderr,
         )
+        return None
+    return run_id if isinstance(run_id, int) and not isinstance(run_id, bool) else None
 
 
 def _post_gate_comment(

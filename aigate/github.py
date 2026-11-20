@@ -286,12 +286,42 @@ def _gh_list(path: str) -> list:
     return out
 
 
+# A caller that holds the gate's configuration itself names a file with it
+# here; every read of the gate configuration (``.github/ai-gate.yml``) then
+# returns that file's text instead of the repository's, so all readers in the
+# process agree. Unset, the repository's file is read as always.
+CONFIG_FILE_ENV = "AIGATE_CONFIG_FILE"
+_GATE_CONFIG_PATH = ".github/ai-gate.yml"  # gateconfig.GATE_CONFIG_PATH
+
+
+def config_override() -> str | None:
+    """The text of ``AIGATE_CONFIG_FILE``, or ``None`` when it is not set.
+
+    A set but unreadable file raises ``GitHubError``: the caller meant to
+    replace the repository's configuration, so falling back to it is wrong.
+    """
+    path = os.environ.get(CONFIG_FILE_ENV, "").strip()
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+    except OSError as exc:
+        raise GitHubError(f"{CONFIG_FILE_ENV} is set but unreadable: {exc}") from exc
+
+
 def read_config_text(slug: str, base_ref: str, path: str) -> str | None:
     """Fetch a file from the base branch, or ``None`` if it is absent.
 
     Reading from ``base_ref`` rather than the head means the pull request being
-    judged cannot edit the configuration that judges it.
+    judged cannot edit the configuration that judges it. For the gate's own
+    configuration, ``AIGATE_CONFIG_FILE`` (``config_override``) replaces the
+    repository's file entirely.
     """
+    if path == _GATE_CONFIG_PATH:
+        override = config_override()
+        if override is not None:
+            return override
     # `gh api` switches to POST when any `-f` field is passed, and a POST here
     # 404s, which would read as "file absent" and silently drop the config.
     # `--method GET` sends `ref` as a query parameter instead.
@@ -571,8 +601,10 @@ def post_check_run(
     conclusion: str | None,
     title: str,
     summary: str,
-) -> None:
-    """Post the gate's verdict as a check run on ``head_sha``.
+) -> int | None:
+    """Post the gate's verdict as a check run on ``head_sha``; return its id.
+
+    ``None`` when the reply carries no id (the run was still created).
 
     A run triggered by a reviewer's ``check_run`` does not update the pull
     request's own job status, but a check run on the head SHA does, so this is
@@ -602,6 +634,12 @@ def post_check_run(
         raise GitHubError(
             f"gh api POST repos/{slug}/check-runs failed: {proc.stderr.strip()}"
         )
+    try:
+        created = json.loads(proc.stdout or "null")
+    except json.JSONDecodeError:
+        return None
+    run_id = created.get("id") if isinstance(created, dict) else None
+    return run_id if isinstance(run_id, int) and not isinstance(run_id, bool) else None
 
 
 def current_actor_login() -> str | None:

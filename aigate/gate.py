@@ -56,6 +56,9 @@ class Decision:
     # True when SUCCESS came from a qualifying human approval standing in for a
     # missing or failed AI review, so the pull request comment can say so.
     via_human_fallback: bool = False
+    # True when the only thing missing is GitHub's commit search catching up
+    # with a new head: a consumer can retry in a few minutes.
+    not_indexed: bool = False
 
     def __post_init__(self) -> None:
         if self.retryable is None:
