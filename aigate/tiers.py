@@ -72,12 +72,17 @@ def _compile(glob: str) -> re.Pattern[str]:
 
     ``**/`` matches zero or more leading directories, ``**`` matches across
     directory separators, ``*`` matches within a single path segment, and ``?``
-    matches one non-separator character.
+    matches one non-separator character. A trailing ``/**`` also matches the
+    directory itself: a submodule (gitlink) or symlink AT ``D`` is listed as
+    the path ``D``, and what it points to is everything under ``D/**``.
     """
     out: list[str] = []
     i, n = 0, len(glob)
     while i < n:
-        if glob[i : i + 3] == "**/":
+        if glob[i:] == "/**":
+            out.append("(?:/.*)?")
+            i = n
+        elif glob[i : i + 3] == "**/":
             out.append("(?:.*/)?")
             i += 3
         elif glob[i : i + 2] == "**":

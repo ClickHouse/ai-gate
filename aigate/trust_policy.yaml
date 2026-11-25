@@ -10,7 +10,8 @@
 #
 # Glob dialect (aigate.tiers.path_matches), over repo-relative paths:
 #   `**/` zero or more directories · `**` anything · `*` within one segment ·
-#   `?` one character.
+#   `?` one character. A trailing `D/**` also matches `D` itself (a
+#   submodule or symlink at `D` is listed as that one path).
 version: 1
 
 # --- Risk tiers (aigate.tiers) ----------------------------------------------

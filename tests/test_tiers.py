@@ -15,6 +15,7 @@ from aigate.tiers import (
     UNKNOWN_PATH_TIER,
     classify,
     classify_path,
+    path_matches,
 )
 
 
@@ -112,5 +113,32 @@ def test_ai_reviewer_instructions_always_need_a_human():
         "src/BUGBOT.md",
         ".cursorrules",
     ):
+        tier, _ = classify_path(path)
+        assert tier == TIER_3, path
+
+
+def test_a_directory_glob_also_matches_the_directory_itself() -> None:
+    # A submodule (gitlink) or symlink AT the directory is listed as that one
+    # path; what it points to is everything under it.
+    for glob, path in (
+        (".github/workflows/**", ".github/workflows"),
+        (".github/actions/**", ".github/actions"),
+        ("**/.cursor/**", ".cursor"),
+        ("**/.cursor/**", "pkg/.cursor"),
+        ("infra/**", "infra"),
+        ("**/auth/**", "services/auth"),
+    ):
+        assert path_matches(path, glob), (glob, path)
+    for glob, path in (
+        (".github/workflows/**", ".github/workflowsx"),
+        (".github/workflows/**", ".github"),
+        ("infra/**", "infrastructure"),
+        ("infra/**", "src/infra"),
+    ):
+        assert not path_matches(path, glob), (glob, path)
+
+
+def test_a_gitlink_at_a_trust_root_directory_is_tier_3() -> None:
+    for path in (".github/workflows", ".github/actions", "infra", "pkg/.cursor"):
         tier, _ = classify_path(path)
         assert tier == TIER_3, path
