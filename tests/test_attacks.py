@@ -190,7 +190,7 @@ def test_review_after_opening_but_for_another_pull_request_does_not_count(
     }
     assert _gate(mocker, tmp_path, runs, closed_heads=[other]) == 1
     body = github.post_check_run.call_args.args[6]
-    assert "also part of #2" in body
+    assert "#2 also contains this commit" in body
 
 
 def test_review_from_before_a_base_change_does_not_count(mocker, tmp_path):
@@ -226,7 +226,7 @@ def test_decoy_whose_head_moved_on_after_its_review_still_counts_as_shared(
         "commits": [HEAD, "f" * 40],
     }
     assert _gate(mocker, tmp_path, runs, closed_heads=[moved]) == 1
-    assert "also part of #2" in github.post_check_run.call_args.args[6]
+    assert "#2 also contains this commit" in github.post_check_run.call_args.args[6]
 
 
 def test_a_search_hit_that_only_mentions_the_commit_does_not_count(mocker, tmp_path):

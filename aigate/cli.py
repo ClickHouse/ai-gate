@@ -304,22 +304,79 @@ def _tied_to_this_pull(
         )
     if not others:
         return decision
-    listed = ", ".join(f"#{n}" for n in others)
     return Decision(
         outcome=FAILURE,
         title="AI review cannot be tied to this pull request",
-        summary=(
-            f"- This commit is also part of {listed}. The AI review is "
-            f"attached to the commit, so it may have reviewed that pull "
-            f"request's change instead of this one.\n\n**What to do:**\n"
-            f"- Close the other pull request if it is not needed, then push a "
-            f"new commit here so the reviewer reviews this pull request.\n"
-            f"- Or ask someone with write access (not the author) to approve "
-            f"this commit, then {_rerun()}."
+        summary=_shared_commit_summary(
+            others, github.shared_commit_reasons(slug, pull.head_sha, pull.number)
         ),
         # A human approval can still arrive while the gate waits.
         retryable=True,
     )
+
+
+def _shared_commit_summary(others: list[int], reasons: dict[int, str]) -> str:
+    """Why this head commit's AI review is ambiguous, per other PR, and what to do.
+
+    The review is a check run on the commit, not on a pull request, so a
+    commit another pull request has (or had) as its head may carry that pull
+    request's review. A pull request stacked ON TOP of this one does not count
+    (its base ends here; it never had this commit as its head).
+    """
+    same = [n for n in others if reasons.get(n) == github.SAME_HEAD]
+    contains = [n for n in others if reasons.get(n) == github.CONTAINS]
+    unknown = [n for n in others if n not in same and n not in contains]
+    lines: list[str] = []
+    todo: list[str] = []
+    if same:
+        lines.append(
+            f"- {_refs(same)} {_has_have(same)} this exact commit as head. The AI "
+            "review is attached to the commit, not to a pull request, so it "
+            "cannot be tied to this one."
+        )
+        todo.append(
+            f"- If {_refs(same)} duplicates this pull request, close it. Otherwise "
+            "push a new commit here so the reviewer reviews this pull request's "
+            "own head."
+        )
+    if contains:
+        lines.append(
+            f"- {_refs(contains)} also {_contain(contains)} this commit: it was "
+            f"{'their' if len(contains) > 1 else 'its'} head at some point (before "
+            "a later push, or a branch reused for another pull request), so the "
+            "review on it may have been for that pull request."
+        )
+        todo.append(
+            "- Push a new commit here (an empty one is enough) so the reviewer "
+            "reviews this pull request's head."
+        )
+    if unknown:
+        lines.append(
+            f"- This commit is also part of {_refs(unknown)}. The AI review is "
+            "attached to the commit, so it may have reviewed that pull "
+            "request's change instead of this one."
+        )
+        todo.append(
+            "- Push a new commit here so the reviewer reviews this pull request."
+        )
+    todo.append(
+        "- Or ask someone with write access (not the author) to approve this "
+        f"commit, then {_rerun()}. A pull request stacked on top of this one is "
+        "not a reason for this message: nothing needs closing for a stack."
+    )
+    return "\n".join(lines) + "\n\n**What to do:**\n" + "\n".join(todo)
+
+
+def _refs(numbers: list[int]) -> str:
+    return ", ".join(f"#{n}" for n in numbers)
+
+
+def _has_have(numbers: list[int]) -> str:
+    return "have" if len(numbers) > 1 else "has"
+
+
+def _contain(numbers: list[int]) -> str:
+    return "contain" if len(numbers) > 1 else "contains"
 
 
 class _Unread:

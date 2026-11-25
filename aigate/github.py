@@ -183,6 +183,17 @@ _PULL_COMMITS_CAP = 250
 # How long a shared-commit answer is reused while the gate polls.
 _SHARED_COMMIT_TTL_SECONDS = 120
 _shared_commit_cache: dict[tuple[str, str, int], tuple[float, list[int]]] = {}
+# Why each listed pull request counts, for the gate's message: SAME_HEAD (an
+# open one with this exact head) or CONTAINS (the commit is in its commits:
+# its head at some point). Filled by ``other_pulls_containing``.
+SAME_HEAD = "same head"
+CONTAINS = "contains"
+_shared_commit_reasons: dict[tuple[str, str, int], dict[int, str]] = {}
+
+
+def shared_commit_reasons(slug: str, sha: str, number: int) -> dict[int, str]:
+    """Why each pull request ``other_pulls_containing`` listed counts; may be empty."""
+    return dict(_shared_commit_reasons.get((slug, sha, number), {}))
 
 
 class NotIndexedYetError(GitHubError):
@@ -206,10 +217,21 @@ def other_pulls_containing(slug: str, sha: str, number: int) -> list[int]:
         return cached[1]
 
     found: set[int] = set()
+    reasons: dict[int, str] = {}
+    associated: set[int] = set()
     listed = gh_json([f"repos/{slug}/commits/{sha}/pulls"])
     for p in listed if isinstance(listed, list) else []:
-        if isinstance(p, dict) and isinstance(p.get("number"), int):
+        if not (isinstance(p, dict) and isinstance(p.get("number"), int)):
+            continue
+        if ((p.get("head") or {}).get("sha") or "").lower() == sha.lower():
             found.add(p["number"])
+            reasons[p["number"]] = SAME_HEAD
+        else:
+            # GitHub also associates a pull request whose BASE branch ends at
+            # this commit (one stacked on top of this branch): that does not
+            # contain the commit, and Bugbot never reviewed it as its head.
+            # Confirm from its own commit list, like a search hit.
+            associated.add(p["number"])
     data = gh_json(
         [
             "search/issues",
@@ -231,7 +253,7 @@ def other_pulls_containing(slug: str, sha: str, number: int) -> list[int]:
         raise NotIndexedYetError(
             f"the commit search does not list #{number} for {sha[:8]} yet"
         )
-    candidates = hits - found - {number}
+    candidates = (hits | associated) - found - {number}
     if len(candidates) > _MAX_SHARED_HEAD_CANDIDATES:
         raise GitHubError(
             f"{len(candidates)} pull requests mention {sha}; too many to check"
@@ -243,9 +265,11 @@ def other_pulls_containing(slug: str, sha: str, number: int) -> list[int]:
             raise GitHubError(f"#{n} has too many commits to check for {sha[:8]}")
         if any(isinstance(c, dict) and c.get("sha") == sha for c in commits):
             found.add(n)
+            reasons.setdefault(n, CONTAINS)
     found.discard(number)
     result = sorted(found)
     _shared_commit_cache[key] = (time.monotonic(), result)
+    _shared_commit_reasons[key] = {n: reasons.get(n, CONTAINS) for n in result}
     return result
 
 
