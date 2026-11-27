@@ -19,7 +19,6 @@ import argparse
 import dataclasses
 import json
 import os
-import re
 import sys
 import time
 from dataclasses import dataclass
@@ -34,6 +33,7 @@ from .gate import (
     Decision,
     Outcome,
     Signal,
+    bugbot_result,
     decide,
     is_cancelled,
     is_reviewer_run,
@@ -241,14 +241,8 @@ def _on_head(finding: threads.ObservedFinding, head_sha: str | None) -> bool:
     return bool(head_sha) and finding.commit_oid == str(head_sha).lower()
 
 
-# How Cursor Bugbot's check summary states what a run found. Live wordings:
-# "Bugbot completed review and found 1 potential issue." (optionally followed
-# by "3 previously reported issues remain unresolved."), and "Bugbot
-# completed review - no issues found." (no new ones; on a red run followed by
-# the previously reported ones still unresolved). Anything else on a red run
-# is not understood, and the gate fails closed rather than guess.
-_FOUND_COUNT = re.compile(r"found (\d+) (?:new )?potential issues?\b")
-_NONE_NEW = re.compile(r"\bno (?:new )?issues found\b", re.IGNORECASE)
+# What a Bugbot run found is read from its last result line, matched whole
+# (``aigate.gate.bugbot_result``).
 # Conclusions a reviewer reports findings with: Bugbot concludes ``neutral``,
 # or ``failure`` where it is set to fail on unresolved findings.
 _REPORTING = frozenset({"neutral", "failure"})
@@ -292,14 +286,12 @@ def _reported_findings(required: list[str], history: list[Signal]) -> Reported:
         runs += 1
         if s.conclusion not in _REPORTING:
             continue
-        m = _FOUND_COUNT.search(s.summary or "")
-        if m is not None:
-            count += int(m.group(1))
-        elif _NONE_NEW.search(s.summary or "") or is_cancelled(s):
-            # Nothing new, or cancelled before reviewing: no findings.
-            continue
-        else:
+        result = bugbot_result(s.summary)
+        if result.kind == "found":
+            count += result.count
+        elif result.kind == "unknown":
             unknown = True
+        # "none" (nothing new) and "cancelled" (no review) report no findings.
     return Reported(count, unknown, runs)
 
 
@@ -630,11 +622,9 @@ def _reported_on(s: Signal) -> bool:
     """Whether a red run reviewed the code and states its final result (how
     many new findings, or none new with earlier ones still unresolved),
     rather than being cancelled or failing first."""
-    summary = s.summary or ""
-    return (
-        s.conclusion in _REPORTING
-        and not is_cancelled(s)
-        and bool(_FOUND_COUNT.search(summary) or _NONE_NEW.search(summary))
+    return s.conclusion in _REPORTING and bugbot_result(s.summary).kind in (
+        "found",
+        "none",
     )
 
 

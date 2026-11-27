@@ -113,28 +113,69 @@ FIX_FINDINGS_STEP = (
 )
 
 
-# A run Bugbot cancelled before it reviewed anything ends neutral with a
-# "**Result:**" line instead, e.g. (live):
-#   "**Result:** Bugbot run cancelled because the base branch changed and the
-#    reviewed diff is no longer current"
-#   "**Result:** Bugbot run cancelled because the review request was cancelled"
-# Such a run reports no findings, like an errored run. Only these exact lines
-# count; any other wording stays not understood.
-_CANCELLED = re.compile(
-    r"^\s*\*\*Result:\*\*\s*Bugbot run cancelled because (?:the base branch "
-    r"changed and the reviewed diff is no longer current|the review request "
-    r"was cancelled)\.?\s*$",
-    re.MULTILINE,
+# What a Cursor Bugbot run's check summary says it did, from its LAST result
+# line: "**Final Result:** ..." when it reviewed, "**Result:** ..." when it was
+# cancelled first. Each pattern is one whole line (no match crosses a newline),
+# and only the last result line counts, so text elsewhere in the summary, or an
+# earlier result line, cannot change what the run is taken to have done.
+# Live wordings:
+#   **Final Result:** Bugbot completed review and found 1 potential issue.
+#   **Final Result:** Bugbot completed review and found 2 potential issues. 3
+#     previously reported issues remain unresolved.   (one line)
+#   **Final Result:** Bugbot completed review - no issues found. 1 previously
+#     reported issue remain unresolved.               (one line)
+#   **Result:** Bugbot run cancelled because the base branch changed and the
+#     reviewed diff is no longer current              (one line)
+#   **Result:** Bugbot run cancelled because the review request was cancelled
+# Anything else is not understood.
+_RESULT_LINE = re.compile(r"^[ \t]*\*\*(Final Result|Result):\*\*[ \t]*(.*?)[ \t]*$")
+_CARRIED = r"(?: [0-9]+ previously reported issues? remains? unresolved\.)?"
+_FOUND_LINE = re.compile(
+    r"Bugbot completed review and found ([0-9]+) potential issues?\." + _CARRIED
 )
+_NONE_LINE = re.compile(r"Bugbot completed review - no issues found\." + _CARRIED)
+_CANCEL_LINE = re.compile(
+    r"Bugbot run cancelled because (?:the base branch changed and the reviewed "
+    r"diff is no longer current|the review request was cancelled)\.?"
+)
+
+
+@dataclass(frozen=True)
+class BugbotResult:
+    """What a Bugbot run's summary says: ``kind`` is ``found`` (``count`` new
+    findings), ``none`` (no new ones), ``cancelled`` (no review) or
+    ``unknown``."""
+
+    kind: str
+    count: int = 0
+
+
+def bugbot_result(summary: str | None) -> BugbotResult:
+    """Read a Bugbot summary's last result line, matched whole (see above)."""
+    last: tuple[str, str] | None = None
+    for line in (summary or "").splitlines():
+        if m := _RESULT_LINE.match(line):
+            last = (m.group(1), m.group(2))
+    if last is None:
+        return BugbotResult("unknown")
+    label, text = last
+    if label == "Final Result":
+        if m := _FOUND_LINE.fullmatch(text):
+            return BugbotResult("found", int(m.group(1)))
+        if _NONE_LINE.fullmatch(text):
+            return BugbotResult("none")
+    elif _CANCEL_LINE.fullmatch(text):
+        return BugbotResult("cancelled")
+    return BugbotResult("unknown")
 
 
 def is_cancelled(signal: Signal) -> bool:
     """Whether the run is one Bugbot cancelled before reviewing: no review.
 
-    Only a run whose summary is known (the full-history read fills it) can be
-    recognised; any other run counts as what its conclusion says.
+    Only a run whose summary is known can be recognised; any other run counts
+    as what its conclusion says.
     """
-    return bool(signal.summary) and bool(_CANCELLED.search(signal.summary or ""))
+    return bool(signal.summary) and bugbot_result(signal.summary).kind == "cancelled"
 
 
 def is_reviewer_run(signal: Signal, reviewer: Reviewer) -> bool:

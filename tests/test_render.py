@@ -1,5 +1,5 @@
 """PR-controlled text cannot carry workflow commands or break the comment's
-Markdown (Opus round 6, R6-7)."""
+Markdown."""
 
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ def test_escalation_reasons_render_paths_safely():
 
 
 def test_every_path_sink_in_the_decision_summary_is_rendered_safely():
-    """Round 7 (Codex 10): the finding lines, the still-open and the dismissed
+    """The finding lines, the still-open and the dismissed
     lines of the summary carry the PR's path through aigate.render, so the
     full summary holds no raw newline, no workflow command and no Markdown
     the path could inject (a link, a closed code span)."""

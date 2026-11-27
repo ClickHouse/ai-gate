@@ -12,7 +12,7 @@ longer than any backtick run inside it, with control characters and the
 workflow-command introducer neutralised the way GitHub documents for command
 values (``%`` -> ``%25``, ``\\r`` -> ``%0D``, ``\\n`` -> ``%0A``); ``::`` becomes
 ``: :`` so no printed line can start a command. Social engineering, not
-privilege, is what this stops (Opus round 6, R6-7).
+privilege, is what this stops.
 """
 
 from __future__ import annotations

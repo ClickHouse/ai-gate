@@ -787,7 +787,7 @@ def test_red_gate_links_each_unresolved_finding(mocker):
 
 
 def test_the_findings_block_renders_a_hostile_path_safely(mocker):
-    # Round 7 (Codex 10): the link text is the PR's path, rendered through
+    # The link text is the PR's path, rendered through
     # aigate.render so it cannot close the link or start a workflow command.
     _patch_event(mocker)
     mocker.patch.object(github, "read_config_text", return_value=None)
