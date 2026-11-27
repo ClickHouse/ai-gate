@@ -25,9 +25,10 @@ dev = [
 [tool.setuptools.packages.find]
 include = ["aigate*"]
 
-# The trust policy is data the package reads at import (aigate.trust).
+# The trust policy is data the package reads at import (aigate.trust), and so
+# is the reviewer allow-list (aigate.reviewers) where the copy has one.
 [tool.setuptools.package-data]
-aigate = ["trust_policy.yaml"]
+aigate = ["trust_policy.yaml", "reviewer_allowlist.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

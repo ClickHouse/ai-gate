@@ -499,6 +499,7 @@ def signals_for(slug: str, sha: str) -> list[Signal]:
                 ),
                 completed_at=run.get("completed_at"),
                 started_at=run.get("started_at"),
+                app_id=app.get("id") if isinstance(app.get("id"), int) else None,
             )
         )
     return out

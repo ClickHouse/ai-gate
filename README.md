@@ -47,6 +47,14 @@ policy:
   security_dismissal_reviewers: "@your-org/security"
 ```
 
+Listed reviewers are added to Bugbot. An operator can let a named repository
+select another registered reviewer instead, through an optional allow-list
+file next to the package (`aigate/reviewer_allowlist.yaml`, read by
+`aigate.reviewers`); without that file Bugbot is always required. Such a
+reviewer is pinned by App slug and App id, judged on its check's conclusion
+alone (only `success` is clean), and is not eligible for auto-approval unless
+the allow-list says so.
+
 Without a `policy:`, a clean AI review passes. With one, dismissed findings,
 escalation paths and [high-risk files](aigate/tiers.py) also need a human
 approval. See [`ai-gate.example.yml`](ai-gate.example.yml) for every key.

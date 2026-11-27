@@ -197,8 +197,11 @@ def _with_open_findings(
 ) -> Decision:
     """List the reviewer's unresolved findings, linked, above "What to do".
 
-    Best effort: a read failure leaves the verdict unchanged.
+    Best effort: a read failure leaves the verdict unchanged. A conclusion-only
+    reviewer set (empty ``reviewer_login``) has no findings to list.
     """
+    if not reviewer_login:
+        return decision
     try:
         data = github.review_threads(slug, pull.number)
     except github.GitHubError:
@@ -416,7 +419,7 @@ def evaluate(
     try:
         if isinstance(gate_text, _Unread):
             gate_text = github.read_config_text(slug, pull.base_ref, GATE_CONFIG_PATH)
-        required, policy = load_gate_config(gate_text)
+        required, policy = load_gate_config(gate_text, slug)
     except (ConfigError, PolicyError) as exc:
         return _failed(
             f"configuration error — {exc}",
@@ -435,6 +438,11 @@ def evaluate(
         return _failed(f"could not read the AI review — {exc}")
     current, earlier = _split_by_opening(signals, opened_at)
     decision = decide(required, current, earlier=earlier)
+    # Findings are review threads, and only a reviewer that posts threads has
+    # them. When every required reviewer is conclusion-only, no thread is a
+    # finding: its verdict is its check, cleared by a re-review or a human.
+    if reviewers.thread_reviewer_login(required) is None:
+        reviewer_login = ""
     if decision.outcome == SUCCESS:
         # Only a passing review needs proving to be this pull request's, which
         # keeps the extra lookups (one of them a rate-limited search) rare.
@@ -886,13 +894,18 @@ def _enforce(
     paths = github.changed_paths(slug, pull.number)
     tier_result = classify(paths)
 
-    raw = github.review_threads(slug, pull.number)
-    if threads.has_more_threads(raw):
-        raise github.GitHubRefusalError(
-            f"pull request #{pull.number} has more than 100 review threads; "
-            f"refusing to judge a truncated list."
-        )
-    pr_author, findings = threads.parse_review_threads(raw, reviewer_login)
+    if reviewer_login:
+        raw = github.review_threads(slug, pull.number)
+        if threads.has_more_threads(raw):
+            raise github.GitHubRefusalError(
+                f"pull request #{pull.number} has more than 100 review threads; "
+                f"refusing to judge a truncated list."
+            )
+        pr_author, findings = threads.parse_review_threads(raw, reviewer_login)
+    else:
+        # Every required reviewer is conclusion-only: no thread is a finding,
+        # so the threads are not read (nor CODEOWNERS for dismissals below).
+        pr_author, findings = github.pull_author(slug, pull.number), []
     if pr_author is None:
         raise github.GitHubRefusalError(
             f"could not determine the author of {slug}#{pull.number}; "
@@ -904,7 +917,7 @@ def _enforce(
     # CODEOWNERS decides who may dismiss a finding only when no
     # security_dismissal_reviewers is configured.
     rules: list[codeowners.Rule] = []
-    if policy.security_dismissal_reviewers is None:
+    if findings and policy.security_dismissal_reviewers is None:
         rules = codeowners.parse(github.read_codeowners(slug, pull.base_ref) or "")
 
     verdicts = []

@@ -36,6 +36,9 @@ class Signal:
     conclusion: str | None
     completed_at: str | None = None
     started_at: str | None = None
+    # The posting App's numeric id, where the source reports it. A reviewer
+    # that pins ``app_id`` never matches a signal without one.
+    app_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -104,7 +107,11 @@ def is_reviewer_run(signal: Signal, reviewer: Reviewer) -> bool:
     the app's checks: Cursor's app also posts ``Cursor Bugbot Autofix``, which
     reports ``success`` without reviewing anything.
     """
-    return signal.app_slug == reviewer.app_slug and signal.name == reviewer.check_name
+    return (
+        signal.app_slug == reviewer.app_slug
+        and signal.name == reviewer.check_name
+        and (reviewer.app_id is None or signal.app_id == reviewer.app_id)
+    )
 
 
 def all_required_green(

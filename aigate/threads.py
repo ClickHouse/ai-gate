@@ -49,6 +49,8 @@ def parse_review_threads(
     """Extract ``(pr_author_login, findings)`` from a reviewThreads payload.
 
     Keep only threads whose first comment was posted by ``reviewer_login``.
+    An empty ``reviewer_login`` (every required reviewer is conclusion-only)
+    keeps none.
     """
     pr = (((data or {}).get("data") or {}).get("repository") or {}).get(
         "pullRequest"
@@ -63,7 +65,11 @@ def parse_review_threads(
         comments = ((node.get("comments") or {}).get("nodes")) or []
         first = comments[0] if comments else {}
         author_login = ((first.get("author") or {}).get("login")) or ""
-        if not author_login or not _same_actor(author_login, reviewer_login):
+        if (
+            not reviewer_login
+            or not author_login
+            or not _same_actor(author_login, reviewer_login)
+        ):
             continue
         resolved_by = node.get("resolvedBy") or None
         findings.append(

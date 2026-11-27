@@ -35,15 +35,18 @@ _TOP_KEYS = frozenset({"reviewers", "policy", "approver"})
 _APPROVER_KEYS = frozenset({"forks", "risk"})
 
 
-def load_gate_config(text: str | None) -> tuple[list[str], GatePolicy | None]:
+def load_gate_config(
+    text: str | None, slug: str | None = None
+) -> tuple[list[str], GatePolicy | None]:
     """Resolve ``(required_reviewers, policy)`` from ``.github/ai-gate.yml``.
 
     ``text`` is the file from the base branch, or ``None`` when absent (the
     defaults). An empty file or an unknown top-level key is an error, so a
-    config that silently does nothing cannot pass.
+    config that silently does nothing cannot pass. ``slug`` is the repository,
+    for the central reviewer allow-list (``reviewers.load_config``).
     """
     if text is None:
-        return load_config(None), load_policy(None)
+        return load_config(None, slug), load_policy(None)
 
     try:
         doc = yaml.safe_load(text)
@@ -84,7 +87,7 @@ def load_gate_config(text: str | None) -> tuple[list[str], GatePolicy | None]:
         policy_text = None
 
     _approver_section(doc)
-    return load_config(reviewers_text), load_policy(policy_text)
+    return load_config(reviewers_text, slug), load_policy(policy_text)
 
 
 def approver_fork_mode(text: str | None) -> str | None:
