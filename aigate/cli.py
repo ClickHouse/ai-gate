@@ -19,8 +19,10 @@ import argparse
 import dataclasses
 import json
 import os
+import re
 import sys
 import time
+from dataclasses import dataclass
 
 from . import codeowners, escalation, github, reviewers, threads
 from .gate import (
@@ -33,6 +35,7 @@ from .gate import (
     Outcome,
     Signal,
     decide,
+    is_cancelled,
     is_reviewer_run,
 )
 from .gateconfig import GATE_CONFIG_PATH, load_gate_config
@@ -121,6 +124,8 @@ def _failed(msg: str, step: str | None = None, *, rerun_helps: bool = True) -> D
 # maintain and custom roles into a base role; read and triage cannot merge, so
 # they do not count.
 HUMAN_FALLBACK_ROLES = frozenset({"admin", "write"})
+# Roles (``role_name``) whose reply-and-resolve accepts a reviewer finding.
+MAINTAINER_ROLES = frozenset({"admin", "maintain"})
 
 
 def _can_write(slug: str, login: str) -> bool:
@@ -189,6 +194,331 @@ def _with_human_fallback(
             f"\n\n{decision.summary}"
         ),
         via_human_fallback=True,
+    )
+
+
+def _maintainer_accepted(
+    slug: str,
+    finding: threads.ObservedFinding,
+    roles: dict[str, str | None],
+    head_sha: str | None = None,
+) -> bool:
+    """Return True if a maintainer replied in ``finding``'s thread and resolved it.
+
+    The resolver must have the maintain or admin role (the pull request author
+    counts too) and have replied in the thread: a bare resolve says nothing
+    about why the finding is wrong. A thread resolved before the code moved
+    (outdated) accepted an earlier state and does not count, unless it was
+    posted on ``head_sha`` itself (only the base moved: the same code). An
+    unreadable role does not count. ``roles`` caches logins already looked up.
+    """
+    login = finding.resolved_by_login
+    if not finding.is_resolved or not login:
+        return False
+    if finding.is_outdated and not _on_head(finding, head_sha):
+        return False
+    if not finding.replied_by(login):
+        return False
+    key = login.casefold()
+    if key not in roles:
+        try:
+            roles[key] = github.repo_role_name(slug, login)
+        except github.GitHubError:
+            roles[key] = None
+    return roles[key] in MAINTAINER_ROLES
+
+
+def _accept_step() -> str:
+    """How a finding the author thinks is wrong gets accepted."""
+    return (
+        "A finding you think is wrong: a maintainer of the repository (maintain "
+        "or admin role, the author included) replies in its thread with why and "
+        f"resolves it, then {_rerun()}."
+    )
+
+
+def _on_head(finding: threads.ObservedFinding, head_sha: str | None) -> bool:
+    return bool(head_sha) and finding.commit_oid == str(head_sha).lower()
+
+
+# How Cursor Bugbot's check summary states what a run found. Live wordings:
+# "Bugbot completed review and found 1 potential issue." (optionally followed
+# by "3 previously reported issues remain unresolved."), and "Bugbot
+# completed review - no issues found." (no new ones; on a red run followed by
+# the previously reported ones still unresolved). Anything else on a red run
+# is not understood, and the gate fails closed rather than guess.
+_FOUND_COUNT = re.compile(r"found (\d+) (?:new )?potential issues?\b")
+_NONE_NEW = re.compile(r"\bno (?:new )?issues found\b", re.IGNORECASE)
+# Conclusions a reviewer reports findings with: Bugbot concludes ``neutral``,
+# or ``failure`` where it is set to fail on unresolved findings.
+_REPORTING = frozenset({"neutral", "failure"})
+# GitHub keeps at most this many runs of one check name in a check suite and
+# deletes older ones: near the cap, the run that reported findings may be
+# gone, so the history cannot be trusted.
+RUN_RETENTION_CAP = 1000
+RUN_RETENTION_GUARD = RUN_RETENTION_CAP - 50
+
+
+@dataclass(frozen=True)
+class Reported:
+    """What a reviewer's runs on one commit said they found.
+
+    ``count`` adds up the new findings the runs' summaries state. ``unknown``
+    is True when a red (``neutral``/``failure``) run's summary is in no known
+    wording. ``runs`` is how many runs of the reviewer the history holds.
+    """
+
+    count: int = 0
+    unknown: bool = False
+    runs: int = 0
+
+    @property
+    def any(self) -> bool:
+        return self.count > 0
+
+    @property
+    def near_cap(self) -> bool:
+        return self.runs >= RUN_RETENTION_GUARD
+
+
+def _reported_findings(required: list[str], history: list[Signal]) -> Reported:
+    """Read every run of a required reviewer on this commit, whenever it ran:
+    before the pull request was opened or the base last changed, it reviewed
+    the same code."""
+    count, unknown, runs = 0, False, 0
+    for s in history:
+        if not any(is_reviewer_run(s, reviewers.REVIEWERS[key]) for key in required):
+            continue
+        runs += 1
+        if s.conclusion not in _REPORTING:
+            continue
+        m = _FOUND_COUNT.search(s.summary or "")
+        if m is not None:
+            count += int(m.group(1))
+        elif _NONE_NEW.search(s.summary or "") or is_cancelled(s):
+            # Nothing new, or cancelled before reviewing: no findings.
+            continue
+        else:
+            unknown = True
+    return Reported(count, unknown, runs)
+
+
+def _history_untrusted(reported: Reported) -> Decision:
+    if reported.near_cap:
+        why = (
+            f"the reviewer has {reported.runs} runs on this commit, near the "
+            f"{RUN_RETENTION_CAP} GitHub keeps per check: older runs, possibly "
+            "the one that reported findings, may be gone"
+        )
+    else:
+        why = (
+            "a run of the reviewer on this commit ended red with a summary in a "
+            "wording the gate does not know, so it cannot tell what it found"
+        )
+    return Decision(
+        outcome=FAILURE,
+        title="AI review history cannot be trusted",
+        summary=(
+            f"- {why[:1].upper()}{why[1:]}.\n\n**What to do:**\n- Push a "
+            "commit: the reviewer reviews it fresh."
+        ),
+        findings_on_head=True,
+    )
+
+
+def _missing_findings(
+    findings: list[threads.ObservedFinding], head_sha: str, reported: Reported
+) -> str | None:
+    """Why the reviewer's threads cannot show that every finding it reported on
+    this commit was dealt with, or ``None``.
+
+    Anyone with write access can delete a comment, and a deleted finding has no
+    thread to judge: the threads posted on this commit must be at least as many
+    as its runs said they found.
+    """
+    on_head = sum(1 for f in findings if _on_head(f, head_sha))
+    if on_head < reported.count:
+        return (
+            f"the reviewer reported {reported.count} finding(s) on this commit but "
+            f"only {on_head} of its threads are left (deleted, or posted elsewhere)"
+        )
+    return None
+
+
+def _missing_decision(reason: str) -> Decision:
+    return Decision(
+        outcome=FAILURE,
+        title="AI review findings cannot be found",
+        summary=(
+            f"- {reason[:1].upper()}{reason[1:]}. A later clean run on the same "
+            "commit does not clear them.\n\n**What to do:**\n- Push a fix: the "
+            "reviewer re-reviews the new commit."
+        ),
+        findings_on_head=True,
+    )
+
+
+def _with_accepted_findings(
+    slug: str,
+    pull: github.PullRef,
+    decision: Decision,
+    reviewer_login: str,
+    policy: GatePolicy | None,
+    reported: Reported | None = None,
+    snapshot: dict | None = None,
+) -> Decision:
+    """Judge the reviewer's findings on this commit by who resolved them.
+
+    Runs when a required reviewer reported findings on the head commit: as the
+    latest result (``findings_only``), or in an earlier run on the same commit
+    that a later clean run followed. A re-run without a push is the same code,
+    so the findings stand until each is accepted; a new push starts fresh.
+
+    Without a policy, every open thread keeps the gate red, and every thread
+    resolved on the current code must be a maintainer's reply-and-resolve
+    (``_maintainer_accepted``). Under a policy the ledger in ``_enforce``
+    judges the resolutions, so a reported-findings FAILURE with no open thread
+    is handed to it. Read failures keep the decision red.
+    """
+    sticky = decision.outcome == SUCCESS
+    try:
+        data = github.review_threads(slug, pull.number)
+    except github.GitHubError as exc:
+        return _failed(f"could not read the AI reviewer's findings — {exc}")
+    if threads.has_more_threads(data):
+        return _failed(
+            f"pull request #{pull.number} has more than 100 review threads; "
+            "refusing to judge a truncated list.",
+            rerun_helps=False,
+        )
+    if snapshot is not None:
+        snapshot["threads"] = data
+    _, findings = threads.parse_review_threads(data, reviewer_login)
+    reported = reported or Reported()
+    head = pull.head_sha
+    # Open on the current code. A thread an earlier commit's review left open
+    # and that has since gone outdated does not block: a new head starts
+    # fresh, and its own review says whether the problem is still there.
+    open_ = [
+        f
+        for f in findings
+        if not f.is_resolved and (not f.is_outdated or _on_head(f, head))
+    ]
+    # Resolved on the current code; on this commit itself, outdated too (only
+    # the base moved), so retargeting cannot take a finding out of judging.
+    current = [
+        f
+        for f in findings
+        if f.is_resolved and (not f.is_outdated or _on_head(f, head))
+    ]
+    if reported.unknown or reported.near_cap:
+        # Cannot tell what was reported: never green from here.
+        return decision if not sticky else _history_untrusted(reported)
+    posted_here = any(_on_head(f, head) for f in findings)
+    if not reported.count and not posted_here:
+        # The run ended neutral/failure without saying it found anything and
+        # left no thread on this commit: an error or timeout, not findings.
+        # A later clean run stands; the reviewer's own red stays red (threads
+        # of earlier commits cannot green it).
+        return decision
+
+    if sticky and not open_ and not current:
+        # Findings were reported on this very commit, yet none of the
+        # reviewer's threads is left on it: deleted (anyone with write access
+        # can delete a comment) or moved. Nothing shows they were accepted.
+        return _missing_decision(
+            "the reviewer reported findings on this commit in an earlier run, "
+            "but none of its comment threads is on the current code (deleted, "
+            "or the code moved)"
+        )
+    # Checked before anything goes green: a deleted finding cannot be judged.
+    missing = _missing_findings(findings, pull.head_sha, reported)
+
+    if policy is not None:
+        if missing and (sticky or (not open_ and current)):
+            return _missing_decision(missing)
+        if sticky or open_ or not current:
+            # Sticky: _enforce runs the ledger on a SUCCESS anyway. Otherwise
+            # the reported-findings verdict stands until nothing is open and
+            # something on the current code shows how they were resolved.
+            return decision
+        return Decision(
+            outcome=SUCCESS,
+            title="AI review findings resolved",
+            summary=(
+                "The reviewer reported findings on this commit; none is open. "
+                "The escalation policy decides how they were resolved."
+            ),
+        )
+
+    if not sticky and not open_ and not current:
+        # Nothing on the current code to judge: keep the reviewer's verdict.
+        return decision
+    roles: dict[str, str | None] = {}
+    not_accepted = [
+        f for f in current if not _maintainer_accepted(slug, f, roles, head)
+    ]
+    if not open_ and not not_accepted:
+        if missing:
+            return _missing_decision(missing)
+        return dataclasses.replace(
+            decision,
+            outcome=SUCCESS,
+            title="AI review findings accepted by a maintainer",
+            summary=(
+                f"The reviewer reported findings on this commit. Each of the "
+                f"{len(current)} on the current code was answered and resolved "
+                f"by a maintainer: "
+                + ", ".join(sorted({f"@{f.resolved_by_login}" for f in current}))
+                + "."
+            ),
+            findings_only=False,
+        )
+
+    if not sticky and not not_accepted:
+        # Only open findings: the reviewer's own verdict says it best; add how
+        # a maintainer can accept one.
+        return dataclasses.replace(
+            decision,
+            summary=decision.summary.replace(
+                f"- {FIX_FINDINGS_STEP}",
+                f"- {FIX_FINDINGS_STEP}\n- {_accept_step()}",
+                1,
+            ),
+        )
+    lines: list[str] = []
+    if sticky:
+        lines.append(
+            "- The reviewer reported findings on this commit in an earlier run. "
+            "A later clean run on the same commit does not clear them: the code "
+            "has not changed."
+        )
+    else:
+        lines.append("- " + decision.summary.splitlines()[0].lstrip("- "))
+    for f in not_accepted[:10]:
+        where = safe_inline(f.path) if f.path else "comment"
+        shown = f"[{where}]({f.url})" if f.url else where
+        who = f"@{f.resolved_by_login}" if f.resolved_by_login else "someone"
+        lines.append(
+            f"- {shown}: resolved by {who}, which does not accept it (needs a "
+            f"maintainer's reply and resolve)."
+        )
+    if len(not_accepted) > 10:
+        lines.append(f"- …and {len(not_accepted) - 10} more not accepted")
+    steps = [
+        "Fix the findings and push: the reviewer re-reviews the new commit.",
+        _accept_step(),
+    ]
+    summary = "\n".join([*lines, "", "**What to do:**", *(f"- {x}" for x in steps)])
+    return Decision(
+        outcome=FAILURE,
+        title=(
+            "AI review findings not accepted"
+            if not open_
+            else (decision.title if not sticky else "AI review findings still open")
+        ),
+        summary=summary,
+        findings_on_head=True,
     )
 
 
@@ -293,6 +623,69 @@ def _tied_to_this_pull(
         decision = decide(required, current, earlier=earlier)
         if decision.outcome != SUCCESS:
             return decision
+    return _sole_pull(slug, pull, decision)
+
+
+def _reported_on(s: Signal) -> bool:
+    """Whether a red run reviewed the code and states its final result (how
+    many new findings, or none new with earlier ones still unresolved),
+    rather than being cancelled or failing first."""
+    summary = s.summary or ""
+    return (
+        s.conclusion in _REPORTING
+        and not is_cancelled(s)
+        and bool(_FOUND_COUNT.search(summary) or _NONE_NEW.search(summary))
+    )
+
+
+def _accepted_review_is_current(
+    slug: str,
+    pull: github.PullRef,
+    required: list[str],
+    signals: list[Signal],
+    opened_at: str,
+    decision: Decision,
+    history: list[Signal] | None = None,
+) -> Decision:
+    """Keep a green from accepted findings only if a review that reported
+    findings started after the pull request's base last changed.
+
+    Retargeting changes the change under review: findings on a small diff
+    against a side branch say nothing about the diff against the new base. A
+    run Bugbot cancelled after the change (it cancels on a base change) ends
+    red too but reviewed nothing, so it does not count: ``history`` (every run
+    on the head, with summaries) must hold a run that started strictly after
+    the change and states how many findings it found.
+    """
+    changed = github.last_base_change(slug, pull.number)
+    if changed is None or changed <= opened_at:
+        return decision
+    current, earlier = _split_by_opening(signals, changed)
+    # Strictly after the change, with a known start and a stated count: a
+    # cancelled run (Bugbot cancels on a base change) reviewed nothing.
+    reviewed_since = any(
+        s.started_at is not None
+        and s.started_at > changed
+        and _reported_on(s)
+        and any(is_reviewer_run(s, reviewers.REVIEWERS[key]) for key in required)
+        for s in history or ()
+    )
+    if decide(required, current, earlier=earlier).findings_only and reviewed_since:
+        return decision
+    return Decision(
+        outcome=FAILURE,
+        title="AI review is from before the base changed",
+        summary=(
+            "- The review whose findings were accepted ran before this pull "
+            "request's base last changed, so it reviewed a different change.\n\n"
+            f"**What to do:**\n- Post `{BUGBOT_RERUN_COMMENT}` as a new top-level "
+            "PR comment for a fresh review, or push a commit."
+        ),
+    )
+
+
+def _sole_pull(slug: str, pull: github.PullRef, decision: Decision) -> Decision:
+    """Keep ``decision`` only if no other pull request contains the head commit."""
     try:
         others = github.other_pulls_containing(slug, pull.head_sha, pull.number)
     except github.NotIndexedYetError as exc:
@@ -432,10 +825,18 @@ def evaluate(
 
     try:
         if signals is None:
-            signals = github.signals_for(slug, pull.head_sha)
+            signals = github.review_signals(slug, pull.head_sha)
         opened_at = _opened_at(slug, pull)
     except github.GitHubError as exc:
         return _failed(f"could not read the AI review — {exc}")
+    if any(is_cancelled(s) for s in signals):
+        # A caller's runs (or GitHub's latest-only listing) show a cancelled
+        # run, which is no review: decide on every run instead, so the review
+        # before it is the one that counts (``decide`` skips cancelled runs).
+        try:
+            signals = github.signals_for(slug, pull.head_sha, all_runs=True)
+        except github.GitHubError as exc:
+            return _failed(f"could not read the AI review's earlier runs — {exc}")
     current, earlier = _split_by_opening(signals, opened_at)
     decision = decide(required, current, earlier=earlier)
     # Findings are review threads, and only a reviewer that posts threads has
@@ -454,6 +855,56 @@ def evaluate(
             return _failed(
                 f"could not check that the AI review is for this pull request — {exc}"
             )
+    reported = Reported()
+    history: list[Signal] = []
+    # The review threads the findings were judged on, for the policy to judge
+    # the same snapshot.
+    snapshot: dict = {}
+    # Reviewers whose findings are threads; a conclusion-only reviewer's runs
+    # report nothing to judge here.
+    threaded = [k for k in required if reviewers.REVIEWERS[k].has_threads]
+    if (
+        reviewer_login
+        and threaded
+        and (decision.outcome == SUCCESS or decision.findings_only)
+    ):
+        # GitHub lists only each check's latest run by default, so a clean
+        # re-run hides the run that reported findings: read every run on the
+        # commit, whenever it ran, so neither a re-run nor retargeting clears
+        # them. Its summaries also say how many findings there were.
+        try:
+            history = github.signals_for(slug, pull.head_sha, all_runs=True)
+        except github.GitHubError as exc:
+            return _failed(f"could not read the AI review's earlier runs — {exc}")
+        reported = _reported_findings(threaded, history)
+        if reported.near_cap or (decision.outcome == SUCCESS and reported.unknown):
+            decision = _history_untrusted(reported)
+        elif reported.any and not decision.findings_on_head:
+            decision = dataclasses.replace(decision, findings_on_head=True)
+    if (
+        reviewer_login
+        and decision.findings_on_head
+        and (decision.outcome == SUCCESS or decision.findings_only)
+    ):
+        was_red = decision.outcome == FAILURE
+        decision = _with_accepted_findings(
+            slug, pull, decision, reviewer_login, policy, reported, snapshot
+        )
+        if was_red and decision.outcome == SUCCESS:
+            # Greened by accepted findings: the review whose findings were
+            # accepted must be this pull request's, by the rule a clean pass
+            # meets (``_tied_to_this_pull``): started after the base last
+            # changed, and no other pull request containing the commit.
+            try:
+                decision = _accepted_review_is_current(
+                    slug, pull, required, signals, opened_at, decision, history
+                )
+                if decision.outcome == SUCCESS:
+                    decision = _sole_pull(slug, pull, decision)
+            except github.GitHubError as exc:
+                return _failed(
+                    f"could not check that the AI review is for this pull request — {exc}"
+                )
     if human_fallback and decision.outcome == FAILURE:
         decision = _with_open_findings(slug, pull, decision, reviewer_login)
     if human_fallback and decision.outcome != SUCCESS:
@@ -464,7 +915,9 @@ def evaluate(
     if policy is not None and decision.outcome == SUCCESS:
         before_policy = decision
         try:
-            decision = _enforce(slug, pull, policy, reviewer_login)
+            decision = _enforce(
+                slug, pull, policy, reviewer_login, snapshot.get("threads")
+            )
         except github.GitHubRefusalError as exc:
             # A re-run hits the same refusal, and the generic human fallback
             # must not override the policy's named reviewers.
@@ -884,18 +1337,26 @@ def _gate_shadow(slug: str, event: dict, reviewer_login: str) -> int:
 
 
 def _enforce(
-    slug: str, pull: github.PullRef, policy: GatePolicy, reviewer_login: str
+    slug: str,
+    pull: github.PullRef,
+    policy: GatePolicy,
+    reviewer_login: str,
+    raw: dict | None = None,
 ) -> Decision:
     """Gather the facts for the escalation policy and evaluate it.
 
     Policy, CODEOWNERS and configuration come from the base branch. Missing or
-    ambiguous data raises ``GitHubError`` so the caller fails closed.
+    ambiguous data raises ``GitHubError`` so the caller fails closed. ``raw``
+    is the review-thread payload already judged for reported findings
+    (``_with_accepted_findings``): the policy judges that same snapshot, so a
+    thread deleted in between cannot pass one check and miss the other.
     """
     paths = github.changed_paths(slug, pull.number)
     tier_result = classify(paths)
 
     if reviewer_login:
-        raw = github.review_threads(slug, pull.number)
+        if raw is None:
+            raw = github.review_threads(slug, pull.number)
         if threads.has_more_threads(raw):
             raise github.GitHubRefusalError(
                 f"pull request #{pull.number} has more than 100 review threads; "
@@ -921,6 +1382,7 @@ def _enforce(
         rules = codeowners.parse(github.read_codeowners(slug, pull.base_ref) or "")
 
     verdicts = []
+    roles: dict[str, str | None] = {}
     for finding in findings:
         eligible = False
         if (
@@ -932,6 +1394,8 @@ def _enforce(
             and not finding.is_outdated
             and finding.resolved_by_login
             and finding.resolved_by_login != pr_author
+            # Like a maintainer: a bare resolve says nothing about why.
+            and finding.replied_by(finding.resolved_by_login)
             and finding.path
         ):
             owners = codeowners.owners_for_path(rules, finding.path)
@@ -950,6 +1414,9 @@ def _enforce(
             # not show the problem was fixed.
             has_machine_evidence=False,
             resolver_is_eligible_owner=eligible,
+            resolver_is_maintainer_with_reply=_maintainer_accepted(
+                slug, finding, roles, pull.head_sha
+            ),
         )
         verdicts.append(dispose(facts))
 

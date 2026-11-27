@@ -21,13 +21,17 @@ from dataclasses import dataclass
 from .ledger import FindingFacts
 
 
+def _norm(login: str) -> str:
+    return login.casefold().removesuffix("[bot]")
+
+
 def _same_actor(a: str, b: str) -> bool:
     """Compare two logins, ignoring case and a ``[bot]`` suffix.
 
     GraphQL ``Bot.login`` drops the ``[bot]`` suffix that REST keeps, so
     ``cursor[bot]`` comes back as ``cursor`` in the thread query.
     """
-    return a.casefold().removesuffix("[bot]") == b.casefold().removesuffix("[bot]")
+    return _norm(a) == _norm(b)
 
 
 @dataclass(frozen=True)
@@ -41,6 +45,17 @@ class ObservedFinding:
     resolved_by_login: str | None
     author_login: str  # the bot that posted the finding
     url: str | None = None  # the finding's first comment, for linking it
+    # Logins (casefolded, no ``[bot]``) that replied in the thread after the
+    # finding. Empty when the comment list was truncated, so a reply that may
+    # not have been read never counts.
+    repliers: frozenset[str] = frozenset()
+    # The commit the finding was posted on (its first comment's
+    # ``originalCommit``), lower case; ``None`` when not reported.
+    commit_oid: str | None = None
+
+    def replied_by(self, login: str | None) -> bool:
+        """Return True if ``login`` left a reply in this thread."""
+        return login is not None and bool(login) and _norm(login) in self.repliers
 
 
 def parse_review_threads(
@@ -72,6 +87,19 @@ def parse_review_threads(
         ):
             continue
         resolved_by = node.get("resolvedBy") or None
+        truncated = bool(
+            (((node.get("comments") or {}).get("pageInfo")) or {}).get("hasNextPage")
+        )
+        repliers = (
+            frozenset()
+            if truncated
+            else frozenset(
+                _norm(login)
+                for c in comments[1:]
+                if isinstance(c, dict)
+                and (login := ((c.get("author") or {}).get("login")) or "")
+            )
+        )
         findings.append(
             ObservedFinding(
                 thread_id=node.get("id", ""),
@@ -81,6 +109,11 @@ def parse_review_threads(
                 resolved_by_login=(resolved_by.get("login") if resolved_by else None),
                 author_login=author_login,
                 url=first.get("url") or None,
+                repliers=repliers,
+                commit_oid=(
+                    str(((first.get("originalCommit") or {}).get("oid")) or "").lower()
+                    or None
+                ),
             )
         )
     return pr_author, findings
@@ -104,6 +137,7 @@ def to_facts(
     pr_author_login: str | None,
     has_machine_evidence: bool = False,
     resolver_is_eligible_owner: bool = False,
+    resolver_is_maintainer_with_reply: bool = False,
 ) -> FindingFacts:
     """Map an observed finding to ledger facts."""
     resolver_is_author = (
@@ -117,4 +151,5 @@ def to_facts(
         has_machine_evidence=has_machine_evidence,
         resolver_is_eligible_owner=resolver_is_eligible_owner,
         resolver_is_author=resolver_is_author,
+        resolver_is_maintainer_with_reply=resolver_is_maintainer_with_reply,
     )

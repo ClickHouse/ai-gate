@@ -531,6 +531,19 @@ def _approval(
     }
 
 
+def _bugbot_found(n):
+    """A neutral Bugbot run whose summary states its findings (live wording)."""
+    return [
+        Signal(
+            app_slug=BUGBOT,
+            name="Cursor Bugbot",
+            conclusion="neutral",
+            summary=f"**Final Result:** Bugbot completed review and found {n} "
+            f"potential issue{'s' if n != 1 else ''}.",
+        )
+    ]
+
+
 def _bugbot(conclusion):
     return [Signal(app_slug=BUGBOT, name="Cursor Bugbot", conclusion=conclusion)]
 
@@ -724,7 +737,7 @@ def _gate_comment():
 def test_red_gate_links_each_unresolved_finding(mocker):
     _patch_event(mocker)
     mocker.patch.object(github, "read_config_text", return_value=None)
-    mocker.patch.object(github, "signals_for", return_value=_bugbot("neutral"))
+    mocker.patch.object(github, "signals_for", return_value=_bugbot_found(1))
 
     def thread(path, url, resolved):
         return {
@@ -733,7 +746,15 @@ def test_red_gate_links_each_unresolved_finding(mocker):
             "isOutdated": False,
             "path": path,
             "resolvedBy": None,
-            "comments": {"nodes": [{"url": url, "author": {"login": "cursor"}}]},
+            "comments": {
+                "nodes": [
+                    {
+                        "url": url,
+                        "author": {"login": "cursor"},
+                        "originalCommit": {"oid": "abc"},  # posted on the head
+                    }
+                ]
+            },
         }
 
     payload = {
@@ -756,7 +777,11 @@ def test_red_gate_links_each_unresolved_finding(mocker):
     body = _gate_comment()
     assert "Unresolved findings (1):" in body
     assert "[`src/a.rs`](https://x/1)" in body
-    assert "src/b.rs" not in body
+    # b.rs is resolved, so not in the open list; resolved by no maintainer, it
+    # is named as not accepted instead.
+    open_block = body[body.index("Unresolved findings") :].split("\n\n")[0]
+    assert "src/b.rs" not in open_block
+    assert "[`src/b.rs`](https://x/2): resolved by someone" in body
     # The list sits above the steps, not after them.
     assert body.index("Unresolved findings") < body.index("**What to do:**")
 
@@ -889,7 +914,10 @@ def test_rerun_after_marking_ready_reads_the_live_draft_state(mocker, monkeypatc
     github.read_event.return_value["pull_request"]["draft"] = True  # type: ignore[attr-defined]
     mocker.patch.object(github, "read_config_text", return_value=None)
     mocker.patch.object(
-        github, "signals_for", side_effect=[_bugbot(PENDING), _bugbot(SUCCESS)]
+        github,
+        "signals_for",
+        # The last read is every run on the head, for findings a re-run hid.
+        side_effect=[_bugbot(PENDING), _bugbot(SUCCESS), _bugbot(SUCCESS)],
     )
     mocker.patch.object(cli.time, "sleep")
     monkeypatch.setenv("AIGATE_WAIT_SECONDS", "60")
@@ -926,17 +954,25 @@ def test_a_policy_refusal_is_not_called_a_github_problem(mocker):
     assert "repository administrator" in body
 
 
-def test_all_threads_resolved_but_still_neutral_says_ask_for_a_fresh_review(mocker):
+def test_all_threads_resolved_by_no_maintainer_says_they_are_not_accepted(mocker):
     _patch_event(mocker)
     mocker.patch.object(github, "read_config_text", return_value=None)
-    mocker.patch.object(github, "signals_for", return_value=_bugbot("neutral"))
+    mocker.patch.object(github, "signals_for", return_value=_bugbot_found(1))
     node = {
         "id": "t",
         "isResolved": True,
         "isOutdated": False,
         "path": "a.rs",
         "resolvedBy": None,
-        "comments": {"nodes": [{"url": "u", "author": {"login": "cursor"}}]},
+        "comments": {
+            "nodes": [
+                {
+                    "url": "u",
+                    "author": {"login": "cursor"},
+                    "originalCommit": {"oid": "abc"},  # posted on the head
+                }
+            ]
+        },
     }
     mocker.patch.object(
         github,
@@ -954,8 +990,12 @@ def test_all_threads_resolved_but_still_neutral_says_ask_for_a_fresh_review(mock
     )
     assert cli.main(["gate"]) == 1
     body = _gate_comment()
-    assert "threads are resolved" in body
-    assert "Fix the findings" not in body  # no contradicting step
+    assert "AI review findings not accepted" in body
+    assert "resolved by someone, which does not accept it" in body
+    assert "a maintainer of the repository" in body
+    # Not the "all threads resolved, ask for a fresh review" step: a re-run
+    # without a push no longer clears findings on the same commit.
+    assert "threads are resolved" not in body
 
 
 def test_unreadable_live_pr_mid_wait_keeps_waiting(mocker, monkeypatch):
@@ -963,7 +1003,10 @@ def test_unreadable_live_pr_mid_wait_keeps_waiting(mocker, monkeypatch):
     _patch_event(mocker)
     mocker.patch.object(github, "read_config_text", return_value=None)
     mocker.patch.object(
-        github, "signals_for", side_effect=[_bugbot(PENDING), _bugbot(SUCCESS)]
+        github,
+        "signals_for",
+        # The last read is every run on the head, for findings a re-run hid.
+        side_effect=[_bugbot(PENDING), _bugbot(SUCCESS), _bugbot(SUCCESS)],
     )
     mocker.patch.object(cli.time, "sleep")
     mocker.patch.object(github, "pull_detail", side_effect=github.GitHubError("502"))
@@ -979,7 +1022,12 @@ def test_a_draft_bugbot_is_already_reviewing_is_waited_for(mocker, monkeypatch):
     mocker.patch.object(
         github,
         "signals_for",
-        side_effect=[_bugbot(PENDING), _bugbot(PENDING), _bugbot(SUCCESS)],
+        side_effect=[
+            _bugbot(PENDING),
+            _bugbot(PENDING),
+            _bugbot(SUCCESS),
+            _bugbot(SUCCESS),
+        ],
     )
     mocker.patch.object(cli.time, "sleep")
     monkeypatch.setenv("AIGATE_WAIT_SECONDS", "60")
@@ -1487,8 +1535,10 @@ def test_the_org_required_workflow_runs_the_trusted_action_at_main_and_has_no_ch
     assert "actions/checkout" not in text
 
 
-def test_evaluate_with_prefetched_signals_reads_no_check_runs(mocker):
-    read = mocker.patch.object(github, "signals_for")
+def test_evaluate_with_prefetched_signals_reads_only_the_run_history(mocker):
+    # The caller's latest runs decide; a pass also reads every run on the head
+    # (filter=all), for findings a clean re-run hid.
+    read = mocker.patch.object(github, "signals_for", return_value=[])
     pull = github.PullRef(1, "deadbeef", "main", "2000-01-01T00:00:00Z")
     signals = [Signal(app_slug=BUGBOT, name="Cursor Bugbot", conclusion=SUCCESS)]
     decision = cli.evaluate(
@@ -1500,7 +1550,7 @@ def test_evaluate_with_prefetched_signals_reads_no_check_runs(mocker):
         signals=signals,
     )
     assert decision.outcome == SUCCESS
-    read.assert_not_called()
+    read.assert_called_once_with("o/r", "deadbeef", all_runs=True)
 
 
 def test_call_counts_classify_rest_search_and_graphql(mocker):

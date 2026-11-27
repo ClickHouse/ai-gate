@@ -1,6 +1,15 @@
 from __future__ import annotations
 
-from aigate.gate import FAILURE, PENDING, SUCCESS, Signal, all_required_green, decide
+from aigate.gate import (
+    BUGBOT_RERUN_COMMENT,
+    FAILURE,
+    FIX_FINDINGS_STEP,
+    PENDING,
+    SUCCESS,
+    Signal,
+    all_required_green,
+    decide,
+)
 from aigate.reviewers import REVIEWERS, Reviewer
 
 BUGBOT = REVIEWERS["bugbot"].app_slug
@@ -196,3 +205,9 @@ class TestAllRequiredGreen:
             False,
             ["Cursor Bugbot (missing)"],
         )
+
+
+def test_a_failure_verdict_gets_the_findings_guidance_not_a_rerun():
+    d = decide(["bugbot"], [bugbot("failure")])
+    assert FIX_FINDINGS_STEP in d.summary
+    assert BUGBOT_RERUN_COMMENT not in d.summary

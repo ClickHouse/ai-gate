@@ -132,7 +132,7 @@ def classify_path(path: str) -> tuple[int, str]:
         return best_tier, best_reason
     # The directory name is the pull request's: rendered through aigate.render
     # so it reaches the summary and the comment as a code span, never as
-    # Markdown or a workflow command (round 8, Codex 2).
+    # Markdown or a workflow command.
     return (
         UNKNOWN_PATH_TIER,
         f"unmapped area {safe_inline(_top_level(path))} (unknown raises)",

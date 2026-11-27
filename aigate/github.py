@@ -469,6 +469,17 @@ def repo_role(slug: str, login: str) -> str | None:
     return data.get("permission") if isinstance(data, dict) else None
 
 
+def repo_role_name(slug: str, login: str) -> str | None:
+    """Return ``login``'s role on the repository: ``admin``, ``maintain``,
+    ``write``, ``triage``, ``read`` or a custom role's name.
+
+    Unlike :func:`repo_role`, ``maintain`` stays distinct from ``write``.
+    Returns ``None`` when GitHub reports no role.
+    """
+    data = gh_json([f"repos/{slug}/collaborators/{login}/permission"])
+    return data.get("role_name") if isinstance(data, dict) else None
+
+
 def _normalise_check_run(conclusion: str | None, status: str | None) -> str | None:
     if status != "completed":
         return PENDING
@@ -477,11 +488,20 @@ def _normalise_check_run(conclusion: str | None, status: str | None) -> str | No
     return conclusion  # neutral, failure, cancelled, ...: all "not clean"
 
 
-def signals_for(slug: str, sha: str) -> list[Signal]:
-    """Return every check run on ``sha``, with the app that posted it."""
+def signals_for(slug: str, sha: str, *, all_runs: bool = False) -> list[Signal]:
+    """Return the check runs on ``sha``, with the app that posted it.
+
+    By default GitHub lists only the most recent run of each check
+    (``filter=latest``); ``all_runs`` asks for every run, so an earlier run
+    that a re-run superseded is seen too. Each run carries its
+    ``output.summary``.
+    """
+    path = f"repos/{slug}/commits/{sha}/check-runs"
+    if all_runs:
+        path += "?filter=all"
     # Without --slurp, --paginate concatenates one JSON object per page, which
     # is invalid JSON past the first page.
-    data = gh_json([f"repos/{slug}/commits/{sha}/check-runs", "--paginate", "--slurp"])
+    data = gh_json([path, "--paginate", "--slurp"])
     pages = data if isinstance(data, list) else [data]
     runs: list[dict] = []
     for page in pages:
@@ -500,9 +520,25 @@ def signals_for(slug: str, sha: str) -> list[Signal]:
                 completed_at=run.get("completed_at"),
                 started_at=run.get("started_at"),
                 app_id=app.get("id") if isinstance(app.get("id"), int) else None,
+                summary=((run.get("output") or {}).get("summary") or None),
             )
         )
     return out
+
+
+def review_signals(slug: str, sha: str) -> list[Signal]:
+    """The check runs to judge ``sha``'s review on.
+
+    GitHub's default listing holds only each check's latest run. When that run
+    is one Bugbot cancelled before reviewing (no review), every run is read
+    instead, so the review before it is the one that counts.
+    """
+    from .gate import is_cancelled  # gate imports nothing from here
+
+    signals = signals_for(slug, sha)
+    if any(is_cancelled(s) for s in signals):
+        signals = signals_for(slug, sha, all_runs=True)
+    return signals
 
 
 # The "list pull request files" endpoint silently truncates at this many files.
@@ -583,7 +619,10 @@ def review_threads(slug: str, pr_number: int) -> dict:
               isOutdated
               path
               resolvedBy { login }
-              comments(first: 1) { nodes { url author { login } } }
+              comments(first: 50) {
+                pageInfo { hasNextPage }
+                nodes { url author { login } originalCommit { oid } }
+              }
             }
           }
         }

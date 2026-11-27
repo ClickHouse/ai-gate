@@ -75,7 +75,16 @@ High/Critical risk, even a maintainer's or a code owner's own
 - Config and `CODEOWNERS` are read from the base branch.
 - If the AI review is missing or not clean, an approval of the head commit from
   someone with write access (not the author) passes instead.
-- Any error fails closed.
+- A finding someone thinks is wrong is accepted when a maintainer of the
+  repository (`maintain` or `admin` role, the pull request author included)
+  replies in its thread and resolves it. A bare resolve, or one by someone
+  with less access, is not. When every finding on the head commit is accepted
+  and none is open, the gate passes.
+- Findings stick to the commit: a later clean review of the same commit does
+  not clear what an earlier review of it reported. Every review run on the
+  commit is read, and the findings' threads must all still be there (a deleted
+  one keeps the gate red). A new push starts fresh.
+- Any error, or a review history it cannot read with certainty, fails closed.
 
 ## Development
 

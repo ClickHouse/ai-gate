@@ -4,10 +4,13 @@
   evidence that the fix works. The reviewer no longer flagging it does not
   count: a cosmetic change can cause that, and the recheck is itself a model.
 * A dismissal is a risk acceptance, so a person must make it. It is
-  ``OWNER_ACCEPTED`` only when an eligible non-author owner resolved it;
-  otherwise it is ``HAND_WAVED``.
+  ``OWNER_ACCEPTED`` when an eligible non-author owner resolved it, or when a
+  maintainer of the repository (``maintain`` or ``admin`` role, the author
+  included) replied in the thread and resolved it; otherwise it is
+  ``HAND_WAVED``.
 * The reviewer reports no severity, so every finding is treated as one that
-  matters: none may be closed by the author alone.
+  matters: an author without the maintainer role cannot close one alone, and a
+  maintainer must say why (a reply) rather than only resolve.
 """
 
 from __future__ import annotations
@@ -38,6 +41,8 @@ class FindingFacts:
     has_machine_evidence: bool
     resolver_is_eligible_owner: bool
     resolver_is_author: bool
+    # The resolver has the maintain or admin role and replied in the thread.
+    resolver_is_maintainer_with_reply: bool = False
 
 
 @dataclass(frozen=True)
@@ -55,7 +60,8 @@ def dispose(facts: FindingFacts) -> FindingVerdict:
     """Decide one finding's disposition from its facts.
 
     A proven fix wins regardless of thread state. Otherwise an unresolved
-    finding is pending, and a resolved one needs an eligible non-author owner.
+    finding is pending, and a resolved one needs a maintainer who replied, or
+    an eligible non-author owner.
     """
     # 1. Proven fix, whoever resolved it.
     if facts.has_machine_evidence:
@@ -66,11 +72,18 @@ def dispose(facts: FindingFacts) -> FindingVerdict:
         return _v(facts, Disposition.UNRESOLVED, "no fix evidence and not resolved")
 
     # 3. Resolved without evidence: a dismissal.
+    if facts.resolver_is_maintainer_with_reply:
+        return _v(
+            facts,
+            Disposition.OWNER_ACCEPTED,
+            "risk accepted by a maintainer, with a reply",
+        )
     if facts.resolver_is_author:
         return _v(
             facts,
             Disposition.HAND_WAVED,
-            "refuted by the author; a non-author owner must accept the risk",
+            "resolved by the author, who is not a maintainer; a maintainer must "
+            "reply and resolve it, or a non-author owner must accept the risk",
         )
     if facts.resolver_is_eligible_owner:
         return _v(

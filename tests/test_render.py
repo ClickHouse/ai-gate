@@ -111,7 +111,7 @@ def test_every_path_sink_in_the_decision_summary_is_rendered_safely():
 
 
 def test_an_unmapped_area_name_from_real_classification_is_rendered_safely():
-    """Round 8 (Codex 2): the unknown top-level directory of a changed path is
+    """The unknown top-level directory of a changed path is
     the pull request's; `classify` carries it into the tier reason, which the
     summary (and so the comment) prints. Driven by the real classifier."""
     from aigate.escalation import evaluate

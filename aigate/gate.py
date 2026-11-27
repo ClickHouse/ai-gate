@@ -11,6 +11,7 @@ pass. Outcomes:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Literal
 
@@ -39,6 +40,9 @@ class Signal:
     # The posting App's numeric id, where the source reports it. A reviewer
     # that pins ``app_id`` never matches a signal without one.
     app_id: int | None = None
+    # The run's ``output.summary``, where Cursor Bugbot states how many issues
+    # it found (a cancelled run says so there).
+    summary: str | None = None
 
 
 @dataclass(frozen=True)
@@ -62,6 +66,15 @@ class Decision:
     # True when the only thing missing is GitHub's commit search catching up
     # with a new head: a consumer can retry in a few minutes.
     not_indexed: bool = False
+    # True when a required reviewer reported findings (``neutral``) in any of
+    # its runs on this commit, even if a later run on the same commit passed:
+    # a re-run without a push must not make the findings go away.
+    findings_on_head: bool = False
+    # True for a FAILURE whose only cause may be reported findings: every
+    # failed reviewer concluded ``neutral`` or ``failure`` and none is still
+    # running. Accepted findings on the commit's threads can then green it
+    # (``cli``); with no thread to judge it stays red.
+    findings_only: bool = False
 
     def __post_init__(self) -> None:
         if self.retryable is None:
@@ -100,6 +113,30 @@ FIX_FINDINGS_STEP = (
 )
 
 
+# A run Bugbot cancelled before it reviewed anything ends neutral with a
+# "**Result:**" line instead, e.g. (live):
+#   "**Result:** Bugbot run cancelled because the base branch changed and the
+#    reviewed diff is no longer current"
+#   "**Result:** Bugbot run cancelled because the review request was cancelled"
+# Such a run reports no findings, like an errored run. Only these exact lines
+# count; any other wording stays not understood.
+_CANCELLED = re.compile(
+    r"^\s*\*\*Result:\*\*\s*Bugbot run cancelled because (?:the base branch "
+    r"changed and the reviewed diff is no longer current|the review request "
+    r"was cancelled)\.?\s*$",
+    re.MULTILINE,
+)
+
+
+def is_cancelled(signal: Signal) -> bool:
+    """Whether the run is one Bugbot cancelled before reviewing: no review.
+
+    Only a run whose summary is known (the full-history read fills it) can be
+    recognised; any other run counts as what its conclusion says.
+    """
+    return bool(signal.summary) and bool(_CANCELLED.search(signal.summary or ""))
+
+
 def is_reviewer_run(signal: Signal, reviewer: Reviewer) -> bool:
     """Return True if ``signal`` is ``reviewer``'s review check.
 
@@ -131,7 +168,8 @@ def all_required_green(
     waiting: list[str] = []
     for key in required:
         rv = REVIEWERS[key]
-        mine = [s for s in signals if is_reviewer_run(s, rv)]
+        # Like ``decide``: a run cancelled before it reviewed is no review.
+        mine = [s for s in signals if is_reviewer_run(s, rv) and not is_cancelled(s)]
         if not mine:
             waiting.append(f"{rv.label} (missing)")
         elif any(s.conclusion == PENDING for s in mine):
@@ -160,10 +198,13 @@ def decide(
     failed: list[str] = []
     failed_labels: list[str] = []
     found_issues = False
+    findings_on_head = False
+    only_findings = True
 
     for key in required:
         rv = REVIEWERS[key]
-        mine = [s for s in signals if is_reviewer_run(s, rv)]
+        # A run cancelled before it reviewed is no review at all.
+        mine = [s for s in signals if is_reviewer_run(s, rv) and not is_cancelled(s)]
         if not mine:
             if any(is_reviewer_run(s, rv) for s in earlier):
                 waiting.append(
@@ -177,6 +218,11 @@ def decide(
                 )
             continue
         latest = _latest(mine)
+        # Findings are threads: only a reviewer that posts them has any. A
+        # conclusion-only reviewer's red is its verdict, nothing to accept.
+        findings_on_head = findings_on_head or (
+            rv.has_threads and any(s.conclusion in ("neutral", "failure") for s in mine)
+        )
         if any(s.conclusion == PENDING for s in mine):
             # A review still running on this commit decides; an earlier
             # result must not pass in the meantime.
@@ -187,11 +233,19 @@ def decide(
             raw = latest.conclusion or "unknown"
             meaning = _CONCLUSION_MEANING.get(raw, "did not give a clean pass")
             found_issues = found_issues or raw == "neutral"
+            # Bugbot reports findings as ``neutral``, or as ``failure`` where it
+            # is set to fail on unresolved findings.
+            only_findings = (
+                only_findings and rv.has_threads and raw in ("neutral", "failure")
+            )
             failed.append(f"{rv.label} {meaning} (check concluded '{raw}').")
             failed_labels.append(rv.label)
 
     if failed:
-        if found_issues:
+        # ``failure`` is Bugbot's fail-on-unresolved findings verdict, so it
+        # gets the findings guidance too, never "ask for a fresh review" (a
+        # re-run on the same commit does not clear findings).
+        if found_issues or only_findings:
             steps = [FIX_FINDINGS_STEP]
         else:
             steps = [
@@ -206,6 +260,8 @@ def decide(
                 else "AI review not clean"
             ),
             summary=_summary(failed, passed, steps),
+            findings_on_head=findings_on_head,
+            findings_only=only_findings and not waiting,
         )
     if waiting:
         return Decision(
@@ -222,11 +278,13 @@ def decide(
                     "not enabled for this repository: ask a repository administrator.",
                 ],
             ),
+            findings_on_head=findings_on_head,
         )
     return Decision(
         outcome=SUCCESS,
         title="AI review passed",
         summary="Clean review from: " + ", ".join(passed) + ".",
+        findings_on_head=findings_on_head,
     )
 
 

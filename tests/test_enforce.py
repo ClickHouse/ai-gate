@@ -48,6 +48,7 @@ def _thread(
     outdated: bool = False,
     by: str | None = None,
     author: str = REVIEWER,
+    replies: tuple[str, ...] = (),
 ) -> dict:
     return {
         "id": f"T_{path}",
@@ -55,7 +56,12 @@ def _thread(
         "isOutdated": outdated,
         "path": path,
         "resolvedBy": {"login": by} if by else None,
-        "comments": {"nodes": [{"author": {"login": author}}]},
+        "comments": {
+            "nodes": [
+                {"author": {"login": author}},
+                *({"author": {"login": who}} for who in replies),
+            ]
+        },
     }
 
 
@@ -115,6 +121,12 @@ def _setup(
     # Everyone who approves has write access unless a test says otherwise.
     mocker.patch.object(
         github, "repo_role", side_effect=lambda slug, login: roles.get(login, "write")
+    )
+    # The role name a maintainer's acceptance reads (``maintain``/``admin``).
+    mocker.patch.object(
+        github,
+        "repo_role_name",
+        side_effect=lambda slug, login: roles.get(login, "write"),
     )
 
     def read_config(slug: str, base_ref: str, path: str) -> str | None:
@@ -455,12 +467,23 @@ def test_without_security_reviewers_an_eligible_non_author_owner_can_accept(mock
         mocker,
         policy=POLICY_NO_SECURITY,
         paths=["src/app.py"],
-        threads=[
-            _thread("src/app.py", resolved=True, by="erin")
-        ],  # an eligible code owner
+        # An eligible code owner, who replied in the thread before resolving.
+        threads=[_thread("src/app.py", resolved=True, by="erin", replies=("erin",))],
     )
     assert cli.main(["gate"]) == 0
     assert _posted(post) == ("completed", "success")
+
+
+def test_a_code_owners_bare_resolve_does_not_accept(mocker):
+    # Like a maintainer's: resolving without a reply says nothing about why.
+    post = _setup(
+        mocker,
+        policy=POLICY_NO_SECURITY,
+        paths=["src/app.py"],
+        threads=[_thread("src/app.py", resolved=True, by="erin")],
+    )
+    assert cli.main(["gate"]) == 1
+    assert _posted(post) == ("completed", "failure")
 
 
 def test_without_security_reviewers_a_non_owner_resolver_is_red(mocker):
